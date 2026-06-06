@@ -33,6 +33,8 @@ from .trajectory import (
     LissajousTrajectory,
 )
 from .urdf_loader import urdf_to_mjcf_xml
+from .gait import GaitType, GaitParams
+from .body_controller import BodyController
 
 # Project root
 ROOT = Path(__file__).resolve().parent.parent
@@ -407,6 +409,268 @@ def plot_results(data: dict, leg: str, traj_type: str, output_dir: Path):
     print(f"  ✓ joints_{leg}_{traj_type}.png")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Gait simulation functions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_gait_simulation(model_path: str, gait_type: GaitType,
+                        params: GaitParams, dt: float = 0.002,
+                        total_cycles: float = 5.0):
+    """Run a full-body gait simulation (headless mode).
+
+    Coordinates all four legs through a periodic gait pattern and records
+    tracking data for analysis.
+
+    Args:
+        model_path: Path to MJCF XML file.
+        gait_type: Type of gait (TROT, WALK, PACE, BOUND).
+        params: Gait parameters (cycle period, duty factor, etc.).
+        dt: Simulation time step.
+        total_cycles: Number of gait cycles to simulate.
+
+    Returns:
+        Recorded data dict.
+    """
+    print(f"\n{'='*60}")
+    print(f"  MyDog — Full-Body Gait Simulation")
+    print(f"  Gait: {gait_type.value}, T_cycle={params.T_cycle:.2f}s, "
+          f"duty={params.duty_factor:.2f}")
+    print(f"  Step length={params.step_length:.3f}m, "
+          f"step height={params.step_height:.3f}m")
+    print(f"  Model: {model_path}")
+    print(f"{'='*60}\n")
+
+    # Load model
+    sim = MuJoCoSim(model_path)
+    print(f"Model loaded: {sim.nq} qpos, {sim.nv} qvel, {sim.nu} actuators")
+    print(f"Available actuators: {sim.actuator_names()}")
+
+    # Create body controller
+    bc = BodyController(sim, gait_type, params)
+    print(bc.summary())
+
+    # Timing
+    T_total = total_cycles * params.T_cycle
+    total_steps = int(T_total / dt)
+    print(f"\nSimulating {total_cycles:.1f} cycles ({T_total:.1f}s) "
+          f"at dt={dt}s → {total_steps} steps")
+
+    # Start recording
+    bc.start_recording(total_steps)
+
+    # Simulation loop
+    print("Running simulation...")
+    for step_idx in range(total_steps):
+        t = step_idx * dt
+        bc.control(t)
+        bc.step()
+
+    # Summary
+    total_failures = sum(bc.ik_failures.values())
+    if total_failures > 0:
+        print(f"Warning: {total_failures}/{total_steps * 4} IK solutions failed "
+              f"({bc.ik_failures})")
+    else:
+        print("All IK solutions converged successfully.")
+
+    # Error stats
+    data = bc.get_recorded_data()
+    for leg in ["FR", "FL", "RR", "RL"]:
+        error = data["actual"][leg] - data["target"][leg]
+        rmse = np.sqrt(np.mean(error ** 2, axis=0))
+        print(f"  {leg} RMSE: [{rmse[0]:.4f}, {rmse[1]:.4f}, {rmse[2]:.4f}] m")
+
+    print("Simulation complete.\n")
+    return data
+
+
+def run_gait_simulation_viewer(model_path: str, gait_type: GaitType,
+                               params: GaitParams, dt: float = 0.002):
+    """Run full-body gait simulation with the MuJoCo interactive viewer.
+
+    Opens a real-time 3D GUI window showing the robot walking with all four
+    legs coordinated. Uses substeps to maintain real-time physics at the
+    viewer's display refresh rate (~60 Hz).
+
+    Controls: Space=pause, Scroll=zoom, Right-drag=rotate, Ctrl+Right-drag=pan
+
+    Args:
+        model_path: Path to MJCF XML file.
+        gait_type: Type of gait.
+        params: Gait parameters.
+        dt: Simulation time step.
+    """
+    import mujoco.viewer
+
+    print(f"\n{'='*60}")
+    print(f"  MyDog — Interactive Gait Viewer")
+    print(f"  Gait: {gait_type.value}, T_cycle={params.T_cycle:.2f}s, "
+          f"duty={params.duty_factor:.2f}")
+    print(f"  Step length={params.step_length:.3f}m, "
+          f"step height={params.step_height:.3f}m")
+    print(f"{'='*60}\n")
+    print("Controls: Space=pause, Scroll=zoom, Right-drag=rotate, "
+          "Ctrl+Right-drag=pan\n")
+
+    # Load model and data directly (lightweight wrapper)
+    model = mujoco.MjModel.from_xml_path(model_path)
+    data = mujoco.MjData(model)
+
+    # Create sim wrapper (lightweight, no reload)
+    sim = MuJoCoSim.__new__(MuJoCoSim)
+    sim._model = model
+    sim._data = data
+    sim.model_path = Path(model_path)
+    sim._body_ids = {}
+    sim._joint_ids = {}
+    sim._actuator_ids = {}
+    sim._site_ids = {}
+    sim._build_name_index()
+
+    # Create body controller
+    bc = BodyController(sim, gait_type, params)
+    print(bc.summary())
+
+    # Substep count: enough physics steps per viewer frame for real-time
+    viewer_fps = 60.0
+    substeps = max(1, int(1.0 / (dt * viewer_fps)))
+    print(f"Viewer substeps: {substeps} (dt={dt}s, fps≈{viewer_fps})\n")
+
+    # Launch passive viewer
+    t = 0.0
+    ik_failures = 0
+    cycle_count = 0
+    last_cycle = -1
+
+    with mujoco.viewer.launch_passive(model, data) as viewer:
+        while viewer.is_running():
+            for _ in range(substeps):
+                bc.control(t)
+                mujoco.mj_step(model, data)
+                t += dt
+
+            viewer.sync()
+
+            # Log cycle progress
+            current_cycle = int(t / params.T_cycle)
+            if current_cycle > last_cycle:
+                last_cycle = current_cycle
+                if current_cycle % 10 == 0:
+                    total_failures = sum(bc.ik_failures.values())
+                    if total_failures > 0:
+                        print(f"  Cycle {current_cycle} (t={t:.1f}s) — "
+                              f"IK failures: {total_failures}")
+                    else:
+                        print(f"  Cycle {current_cycle} (t={t:.1f}s)")
+
+    total_failures = sum(bc.ik_failures.values())
+    if total_failures > 0:
+        print(f"Warning: {total_failures} IK failures occurred "
+              f"({bc.ik_failures})")
+    print("Viewer closed.\n")
+
+
+def plot_gait_results(data: dict, gait_type: GaitType, output_dir: Path):
+    """Plot gait simulation results."""
+    print(f"Plotting gait results to {output_dir}...")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    time = data["time"]
+    legs = ["FR", "FL", "RR", "RL"]
+    gname = gait_type.value
+
+    # ── 1. 3D foot trajectories (2×2 subplot per leg) ──
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10), subplot_kw={"projection": "3d"})
+    for ax, leg in zip(axes.flat, legs):
+        tgt = data["target"][leg]
+        act = data["actual"][leg]
+        ax.plot(tgt[:, 0], tgt[:, 1], tgt[:, 2], "b-", linewidth=0.8, alpha=0.7,
+                label="Target")
+        ax.plot(act[:, 0], act[:, 1], act[:, 2], "r--", linewidth=0.6,
+                label="Actual")
+        ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
+        ax.set_title(f"{leg} Foot")
+        ax.legend(fontsize="x-small")
+    fig.suptitle(f"Foot Trajectories — {gname} gait", fontsize=14)
+    fig.tight_layout()
+    fig.savefig(output_dir / f"gait_trajectory_3d_{gname}.png", dpi=150)
+    plt.close(fig)
+    print(f"  ✓ gait_trajectory_3d_{gname}.png")
+
+    # ── 2. Joint angles (4×1 subplot, 3 joints per leg) ──
+    fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
+    for ax, leg in zip(axes, legs):
+        jt = data["joint_targets"][leg]
+        ja = data["joint_actual"][leg]
+        for j, label in enumerate(["Abduction", "Hip", "Knee"]):
+            ax.plot(time, jt[:, j], linewidth=0.8, alpha=0.6,
+                    label=f"{label} target")
+            ax.plot(time, ja[:, j], "--", linewidth=0.6,
+                    label=f"{label} actual")
+        ax.set_ylabel(f"{leg} (rad)")
+        ax.legend(fontsize="xx-small", ncol=6, loc="upper right")
+        ax.grid(True, alpha=0.3)
+    axes[-1].set_xlabel("Time (s)")
+    fig.suptitle(f"Joint Angles — {gname} gait", fontsize=14)
+    fig.tight_layout()
+    fig.savefig(output_dir / f"gait_joints_{gname}.png", dpi=150)
+    plt.close(fig)
+    print(f"  ✓ gait_joints_{gname}.png")
+
+    # ── 3. Foot position components vs time (4 rows × 3 cols) ──
+    fig, axes = plt.subplots(4, 3, figsize=(14, 12), sharex=True, sharey="row")
+    for row, leg in enumerate(legs):
+        tgt = data["target"][leg]
+        act = data["actual"][leg]
+        for col, (axis_name, axis_idx) in enumerate([("X", 0), ("Y", 1), ("Z", 2)]):
+            ax = axes[row, col]
+            ax.plot(time, tgt[:, axis_idx], "b-", linewidth=0.8, label="Target")
+            ax.plot(time, act[:, axis_idx], "r--", linewidth=0.6, label="Actual")
+            if row == 0:
+                ax.set_title(f"{axis_name}")
+            if col == 0:
+                ax.set_ylabel(f"{leg}\n(m)")
+            ax.grid(True, alpha=0.3)
+    axes[-1, 0].set_xlabel("Time (s)")
+    axes[-1, 1].set_xlabel("Time (s)")
+    axes[-1, 2].set_xlabel("Time (s)")
+    fig.suptitle(f"Foot Position vs Time — {gname} gait", fontsize=14)
+    fig.tight_layout()
+    fig.savefig(output_dir / f"gait_position_time_{gname}.png", dpi=150)
+    plt.close(fig)
+    print(f"  ✓ gait_position_time_{gname}.png")
+
+    # ── 4. Gait phase diagram ──
+    fig, ax = plt.subplots(figsize=(12, 4))
+    leg_colors = {"FR": "#E74C3C", "FL": "#3498DB", "RR": "#2ECC71", "RL": "#F39C12"}
+    bar_height = 0.8
+    for i, leg in enumerate(legs):
+        y = i * 1.0
+        # Determine stance/swing transitions for phase visualization
+        T_cycle = time[-1] / round(time[-1] / 0.5) if len(time) > 10 else 0.5
+        T_cycle = max(T_cycle, 0.1)
+        # Sample a few cycles at the end for clarity
+        n_cycles_show = min(4, int(time[-1] / T_cycle))
+        t_start = max(0, time[-1] - n_cycles_show * T_cycle)
+        mask = time >= t_start
+        t_show = time[mask]
+        for j in range(len(t_show) - 1):
+            # Determine state from foot vertical velocity (swing = lifting)
+            z_vel = (data["target"][leg][mask][j + 1, 2] -
+                     data["target"][leg][mask][j, 2]) / (t_show[j + 1] - t_show[j])
+            state = "swing" if z_vel > 0.005 else "stance"
+            color = leg_colors[leg] if state == "stance" else "#BDC3C7"
+            ax.barh(leg, t_show[j + 1] - t_show[j], bar_height,
+                    left=t_show[j], color=color, alpha=0.8)
+    ax.set_xlabel("Time (s)")
+    ax.set_title(f"Gait Phase Diagram — {gname} (color=stance, gray=swing)")
+    ax.set_xlim(t_start, time[-1])
+    fig.tight_layout()
+    fig.savefig(output_dir / f"gait_phase_{gname}.png", dpi=150)
+    plt.close(fig)
+    print(f"  ✓ gait_phase_{gname}.png")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MyDog — Single Foot Trajectory Simulation"
@@ -429,6 +693,24 @@ def main():
                         help="Skip plotting (headless mode only)")
     parser.add_argument("--output", type=str, default=None,
                         help="Output directory for plots (default: output/)")
+
+    # ── Gait mode arguments ──
+    parser.add_argument("--gait", action="store_true",
+                        help="Enable gait-based locomotion (trot/walk/pace/bound)")
+    parser.add_argument("--gait-type", default="trot",
+                        choices=["trot", "walk", "pace", "bound"],
+                        help="Gait pattern (default: trot)")
+    parser.add_argument("--gait-T", type=float, default=0.5,
+                        help="Gait cycle period in seconds (default: 0.5)")
+    parser.add_argument("--gait-duty", type=float, default=0.6,
+                        help="Stance duty factor in (0,1) (default: 0.6)")
+    parser.add_argument("--step-length", type=float, default=0.06,
+                        help="Foot step length in meters (default: 0.06)")
+    parser.add_argument("--step-height", type=float, default=0.04,
+                        help="Foot lift height in meters (default: 0.04)")
+    parser.add_argument("--gait-cycles", type=float, default=5.0,
+                        help="Number of gait cycles to simulate in headless "
+                             "mode (default: 5)")
     args = parser.parse_args()
 
     # Determine model path
@@ -436,6 +718,33 @@ def main():
         model_path = args.model
     else:
         model_path = prepare_model(use_urdf=args.urdf, with_scene=args.viewer)
+
+    # ── Gait mode ──
+    if args.gait:
+        gait_type = GaitType(args.gait_type)
+        params = GaitParams(
+            T_cycle=args.gait_T,
+            duty_factor=args.gait_duty,
+            step_length=args.step_length,
+            step_height=args.step_height,
+        )
+        # Viewer mode
+        if args.viewer:
+            run_gait_simulation_viewer(model_path, gait_type, params, dt=args.dt)
+            return
+
+        # Headless mode
+        matplotlib.use("Agg")
+        output_dir = Path(args.output) if args.output else ROOT / "output"
+
+        data = run_gait_simulation(model_path, gait_type, params,
+                                   dt=args.dt, total_cycles=args.gait_cycles)
+
+        if not args.no_plot:
+            plot_gait_results(data, gait_type, output_dir)
+
+        print("Done.")
+        return
 
     # Viewer mode: interactive 3D GUI
     if args.viewer:

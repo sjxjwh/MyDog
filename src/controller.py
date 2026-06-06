@@ -46,6 +46,19 @@ class IKFootController:
         self._find_names()
         self._joint_names = self._joint_qpos_names
 
+        # Cache joint limits for safe IK (prevents MuJoCo numerical issues)
+        self._joint_limits = []
+        for jname in self._joint_qpos_names:
+            jid = sim._joint_ids.get(jname)
+            if jid is not None and jid < sim._model.njnt:
+                lo = sim._model.jnt_range[jid][0]
+                hi = sim._model.jnt_range[jid][1]
+                # Add a small margin (1%) to avoid boundary instabilities
+                margin = (hi - lo) * 0.01
+                self._joint_limits.append((lo + margin, hi - margin))
+            else:
+                self._joint_limits.append((-np.inf, np.inf))
+
     def _find_names(self):
         """Find joint, actuator, and site names for this leg.
 
