@@ -26,6 +26,7 @@ Thumbs.db
 
 # Output
 output/
+output_gait/
 
 # Jupyter
 .ipynb_checkpoints/
