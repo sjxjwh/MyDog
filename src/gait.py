@@ -165,17 +165,22 @@ class FootTrajectoryPlanner:
     """
 
     def __init__(self, scheduler: GaitScheduler,
-                 neutral_foot: Dict[str, np.ndarray]):
+                 neutral_foot: Dict[str, np.ndarray],
+                 warm_up: float = 0.2):
         """Initialize the trajectory planner.
 
         Args:
             scheduler: GaitScheduler managing phase and leg state.
             neutral_foot: Dict mapping leg name to neutral foot position
                          in hip frame (e.g., from FK at home configuration).
+            warm_up: Duration (seconds) to linearly ramp step_length and
+                     step_height from 0 to their target values. Prevents
+                     large initial IK jumps when a leg starts mid-swing.
         """
         self._scheduler = scheduler
         self._neutral = {leg: np.asarray(pos, dtype=float)
                          for leg, pos in neutral_foot.items()}
+        self._warm_up = warm_up
 
     @property
     def scheduler(self) -> GaitScheduler:
@@ -202,8 +207,11 @@ class FootTrajectoryPlanner:
         state = self._scheduler.leg_state(leg, t)
         s = self._scheduler.phase_in_state(leg, t)  # progress ∈ [0, 1]
         n = self._neutral[leg]  # neutral foot position [nx, ny, nz]
-        L = self.params.step_length
-        H = self.params.step_height
+
+        # Ramp parameters from 0 to target during warm-up period
+        ramp = min(1.0, t / self._warm_up) if self._warm_up > 0 else 1.0
+        L = self.params.step_length * ramp
+        H = self.params.step_height * ramp
 
         if state == "stance":
             # Foot moves backward: nx + L/2 → nx - L/2
@@ -236,3 +244,27 @@ class FootTrajectoryPlanner:
         target_hip = self.get_target_hip(leg, t)
         hip_pos = np.asarray(hip_positions[leg])
         return hip_pos + target_hip
+
+    def get_target_hip_xy(self, leg: str, t: float) -> np.ndarray:
+        """Compute the XY component of the target in hip frame.
+
+        For floating-base, the Z component should be specified in world
+        frame (ground-relative), while XY stays in hip frame.
+        """
+        full = self.get_target_hip(leg, t)
+        return full[:2].copy()
+
+    def get_target_world_z(self, leg: str, t: float) -> float:
+        """Compute the Z component of the target in WORLD frame.
+
+        For stance: z = 0 (on ground).
+        For swing: z = step_height * sin(π * phase_in_swing) (lift).
+        """
+        state = self._scheduler.leg_state(leg, t)
+        s = self._scheduler.phase_in_state(leg, t)
+        ramp = min(1.0, t / self._warm_up) if self._warm_up > 0 else 1.0
+
+        if state == "stance":
+            return 0.0
+        else:
+            return ramp * self.params.step_height * np.sin(np.pi * s)

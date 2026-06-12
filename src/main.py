@@ -35,6 +35,7 @@ from .trajectory import (
 from .urdf_loader import urdf_to_mjcf_xml
 from .gait import GaitType, GaitParams
 from .body_controller import BodyController
+from .force_controller import MITBodyController, GO1_MASS
 
 # Project root
 ROOT = Path(__file__).resolve().parent.parent
@@ -43,6 +44,7 @@ ROOT = Path(__file__).resolve().parent.parent
 MJCF_PATH = ROOT / "model" / "go1.xml"
 MJCF_FIXED_PATH = ROOT / "model" / "go1_fixed.xml"
 SCENE_FIXED_PATH = ROOT / "model" / "scene_fixed.xml"
+SCENE_PATH = ROOT / "model" / "scene.xml"          # floating base + ground
 URDF_PATH = ROOT / "model" / "unitree" / "go1.urdf"
 
 
@@ -177,6 +179,16 @@ def run_simulation(model_path: str, leg: str, traj_type: str,
     home_foot = controller.get_foot_position()
     print(f"Home foot position (world): [{home_foot[0]:.4f}, {home_foot[1]:.4f}, {home_foot[2]:.4f}]")
 
+    # Compute MuJoCo-vs-analytical FK offset (critical for new analytical IK).
+    # The MJCF model has a thigh lateral offset [0, ±0.08, 0] that the
+    # analytical LegKinematics ignores — it is constant in hip frame when the
+    # abduction angle is near zero (typical for locomotion).
+    hip_pos = controller.get_hip_frame_position()
+    hip_rot = sim.get_body_rotation(f"{leg}_hip")
+    foot_hip = hip_rot.T @ (home_foot - hip_pos)
+    foot_analytic_hip, _ = kin.forward_kinematics(home_angles)
+    controller.set_mujoco_offset(foot_hip - foot_analytic_hip)
+
     # Generate trajectory
     traj_points, traj_obj, T = generate_trajectory(traj_type, home_foot, dt)
     n_steps = len(traj_points)
@@ -299,6 +311,13 @@ def run_simulation_viewer(model_path: str, leg: str, traj_type: str,
     home_foot = controller.get_foot_position()
     print(f"Home foot position: [{home_foot[0]:.4f}, {home_foot[1]:.4f}, {home_foot[2]:.4f}]")
 
+    # Compute MuJoCo-vs-analytical FK offset (same as run_simulation above)
+    hip_pos = controller.get_hip_frame_position()
+    hip_rot = sim.get_body_rotation(f"{leg}_hip")
+    foot_hip = hip_rot.T @ (home_foot - hip_pos)
+    foot_analytic_hip, _ = kin.forward_kinematics(home_angles)
+    controller.set_mujoco_offset(foot_hip - foot_analytic_hip)
+
     # Generate trajectory
     traj_points, traj_obj, T = generate_trajectory(traj_type, home_foot, dt)
     n_steps = len(traj_points)
@@ -415,7 +434,8 @@ def plot_results(data: dict, leg: str, traj_type: str, output_dir: Path):
 
 def run_gait_simulation(model_path: str, gait_type: GaitType,
                         params: GaitParams, dt: float = 0.002,
-                        total_cycles: float = 5.0):
+                        total_cycles: float = 5.0, floating: bool = False,
+                        warm_up: float = 0.2):
     """Run a full-body gait simulation (headless mode).
 
     Coordinates all four legs through a periodic gait pattern and records
@@ -427,12 +447,14 @@ def run_gait_simulation(model_path: str, gait_type: GaitType,
         params: Gait parameters (cycle period, duty factor, etc.).
         dt: Simulation time step.
         total_cycles: Number of gait cycles to simulate.
+        floating: If True, use floating-base model (dog moves on ground).
 
     Returns:
         Recorded data dict.
     """
     print(f"\n{'='*60}")
-    print(f"  MyDog — Full-Body Gait Simulation")
+    print(f"  MyDog — Full-Body Gait Simulation"
+          f"{' [FLOATING]' if floating else ''}")
     print(f"  Gait: {gait_type.value}, T_cycle={params.T_cycle:.2f}s, "
           f"duty={params.duty_factor:.2f}")
     print(f"  Step length={params.step_length:.3f}m, "
@@ -446,8 +468,14 @@ def run_gait_simulation(model_path: str, gait_type: GaitType,
     print(f"Available actuators: {sim.actuator_names()}")
 
     # Create body controller
-    bc = BodyController(sim, gait_type, params)
+    bc = BodyController(sim, gait_type, params, floating=floating,
+                        warm_up=warm_up)
     print(bc.summary())
+
+    # Floating base: let the body settle on the ground first
+    if floating:
+        print("Settling body on ground (0.3s)...")
+        bc.settle(duration=0.3, dt=dt)
 
     # Timing
     T_total = total_cycles * params.T_cycle
@@ -485,7 +513,8 @@ def run_gait_simulation(model_path: str, gait_type: GaitType,
 
 
 def run_gait_simulation_viewer(model_path: str, gait_type: GaitType,
-                               params: GaitParams, dt: float = 0.002):
+                               params: GaitParams, dt: float = 0.002,
+                               floating: bool = False):
     """Run full-body gait simulation with the MuJoCo interactive viewer.
 
     Opens a real-time 3D GUI window showing the robot walking with all four
@@ -499,6 +528,7 @@ def run_gait_simulation_viewer(model_path: str, gait_type: GaitType,
         gait_type: Type of gait.
         params: Gait parameters.
         dt: Simulation time step.
+        floating: If True, use floating-base model (dog moves on ground).
     """
     import mujoco.viewer
 
@@ -508,6 +538,8 @@ def run_gait_simulation_viewer(model_path: str, gait_type: GaitType,
           f"duty={params.duty_factor:.2f}")
     print(f"  Step length={params.step_length:.3f}m, "
           f"step height={params.step_height:.3f}m")
+    if floating:
+        print(f"  Mode: FLOATING BASE (dog runs on ground)")
     print(f"{'='*60}\n")
     print("Controls: Space=pause, Scroll=zoom, Right-drag=rotate, "
           "Ctrl+Right-drag=pan\n")
@@ -528,8 +560,13 @@ def run_gait_simulation_viewer(model_path: str, gait_type: GaitType,
     sim._build_name_index()
 
     # Create body controller
-    bc = BodyController(sim, gait_type, params)
+    bc = BodyController(sim, gait_type, params, floating=floating)
     print(bc.summary())
+
+    # Floating base: settle body on ground before starting gait
+    if floating:
+        print("Settling body on ground (0.3s)...")
+        bc.settle(duration=0.3, dt=dt)
 
     # Substep count: enough physics steps per viewer frame for real-time
     viewer_fps = 60.0
@@ -568,6 +605,144 @@ def run_gait_simulation_viewer(model_path: str, gait_type: GaitType,
         print(f"Warning: {total_failures} IK failures occurred "
               f"({bc.ik_failures})")
     print("Viewer closed.\n")
+
+
+def run_gait_force_viewer(model_path: str, gait_type: GaitType,
+                          params: GaitParams, dt: float = 0.002,
+                          target_vx: float = 0.3):
+    """Run force-controlled gait simulation with MuJoCo viewer.
+
+    Uses MIT-style force control (MITBodyController) with body PD,
+    force distribution, and Jacobian-transpose torque control.
+    This is the proper dynamics simulation mode.
+
+    Args:
+        model_path: Path to MJCF XML file (must have freejoint + ground).
+        gait_type: Type of gait.
+        params: Gait parameters.
+        dt: Simulation time step.
+        target_vx: Desired forward velocity (m/s).
+    """
+    import mujoco.viewer
+
+    print(f"\n{'='*60}")
+    print(f"  MyDog — Force-Controlled Gait Viewer [MIT]")
+    print(f"  Gait: {gait_type.value}, T_cycle={params.T_cycle:.2f}s, "
+          f"duty={params.duty_factor:.2f}")
+    print(f"  Step length={params.step_length:.3f}m, "
+          f"step height={params.step_height:.3f}m")
+    print(f"  Target vx={target_vx:.2f} m/s")
+    print(f"{'='*60}\n")
+    print("Controls: Space=pause, Scroll=zoom, Right-drag=rotate, "
+          "Ctrl+Right-drag=pan\n")
+
+    # Load model and data directly
+    model = mujoco.MjModel.from_xml_path(model_path)
+    data = mujoco.MjData(model)
+
+    # Create sim wrapper
+    sim = MuJoCoSim.__new__(MuJoCoSim)
+    sim._model = model
+    sim._data = data
+    sim.model_path = Path(model_path)
+    sim._body_ids = {}
+    sim._joint_ids = {}
+    sim._actuator_ids = {}
+    sim._site_ids = {}
+    sim._build_name_index()
+
+    # Create MIT force controller
+    mc = MITBodyController(sim, gait_type, params)
+    mc.target_vx = target_vx
+    print(f"Body mass: {GO1_MASS:.1f} kg, weight: {GO1_MASS * 9.81:.0f} N")
+    print(f"Controller ready.\n")
+
+    # Settle body on ground using position control
+    print("Settling body on ground (0.5s)...")
+    mc.settle(duration=0.5, dt=dt)
+
+    # Substep count
+    viewer_fps = 60.0
+    substeps = max(1, int(1.0 / (dt * viewer_fps)))
+    print(f"Viewer substeps: {substeps} (dt={dt}s, fps≈{viewer_fps})\n")
+
+    # Launch viewer
+    t = 0.0
+    cycle_count = 0
+    last_cycle = -1
+
+    with mujoco.viewer.launch_passive(model, data) as viewer:
+        while viewer.is_running():
+            for _ in range(substeps):
+                mc.control(t)
+                mujoco.mj_step(model, data)
+                t += dt
+
+            viewer.sync()
+
+            # Log cycle progress
+            current_cycle = int(t / params.T_cycle)
+            if current_cycle > last_cycle:
+                last_cycle = current_cycle
+                if current_cycle % 5 == 0:
+                    pos = data.qpos[0:3]
+                    vel = data.qvel[0:3]
+                    print(f"  Cycle {current_cycle} (t={t:.1f}s) — "
+                          f"pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] "
+                          f"vel=[{vel[0]:.3f}, {vel[1]:.3f}, {vel[2]:.3f}]")
+
+    print("Viewer closed.\n")
+
+
+def run_gait_force_headless(model_path: str, gait_type: GaitType,
+                            params: GaitParams, dt: float = 0.002,
+                            total_cycles: float = 5.0,
+                            target_vx: float = 0.3):
+    """Run force-controlled gait simulation (headless mode).
+
+    Uses MIT-style force control for proper dynamics.
+    """
+    print(f"\n{'='*60}")
+    print(f"  MyDog — Force-Controlled Gait [MIT, headless]")
+    print(f"  Gait: {gait_type.value}, T_cycle={params.T_cycle:.2f}s, "
+          f"duty={params.duty_factor:.2f}")
+    print(f"  Target vx={target_vx:.2f} m/s")
+    print(f"  Model: {model_path}")
+    print(f"{'='*60}\n")
+
+    # Load model
+    sim = MuJoCoSim(model_path)
+    print(f"Model loaded: {sim.nq} qpos, {sim.nv} qvel, {sim.nu} actuators")
+
+    # Create MIT force controller
+    mc = MITBodyController(sim, gait_type, params)
+    mc.target_vx = target_vx
+    print(f"Body mass: {GO1_MASS:.1f} kg, weight: {GO1_MASS * 9.81:.0f} N")
+
+    # Settle
+    print("Settling body on ground (0.5s)...")
+    mc.settle(duration=0.5, dt=dt)
+
+    # Run
+    T_total = total_cycles * params.T_cycle
+    total_steps = int(T_total / dt)
+    print(f"\nSimulating {total_cycles:.1f} cycles ({T_total:.1f}s) "
+          f"at dt={dt}s → {total_steps} steps")
+
+    print("Running simulation...")
+    for step_idx in range(total_steps):
+        t = step_idx * dt
+        mc.control(t)
+        mc.step()
+
+        if step_idx % 500 == 0:
+            pos = sim._data.qpos[0:3]
+            vel = sim._data.qvel[0:3]
+            print(f"  Step {step_idx}/{total_steps}: "
+                  f"pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] "
+                  f"vel=[{vel[0]:.3f}, {vel[1]:.3f}, {vel[2]:.3f}]")
+
+    print("Simulation complete.\n")
 
 
 def plot_gait_results(data: dict, gait_type: GaitType, output_dir: Path):
@@ -711,6 +886,15 @@ def main():
     parser.add_argument("--gait-cycles", type=float, default=5.0,
                         help="Number of gait cycles to simulate in headless "
                              "mode (default: 5)")
+    parser.add_argument("--float", action="store_true", dest="floating",
+                        help="Use floating-base model (dog runs on ground). "
+                             "Only valid with --gait.")
+    parser.add_argument("--force", action="store_true",
+                        help="Use MIT-style force control (torque via J^T F). "
+                             "Only valid with --gait --float. Requires --viewer "
+                             "or --headless.")
+    parser.add_argument("--target-vx", type=float, default=0.3,
+                        help="Target forward velocity for force control (default: 0.3)")
     args = parser.parse_args()
 
     # Determine model path
@@ -728,17 +912,44 @@ def main():
             step_length=args.step_length,
             step_height=args.step_height,
         )
+        # Floating-base: use scene.xml (has ground plane + sky + Go1 freejoint)
+        floating = args.floating
+        if floating and not args.model:
+            model_path = str(SCENE_PATH)
+
+        # ── Force control mode (MIT-style) ──
+        if args.force:
+            if not floating:
+                print("Error: --force requires --float (floating-base model)")
+                sys.exit(1)
+            if args.viewer:
+                run_gait_force_viewer(model_path, gait_type, params,
+                                      dt=args.dt, target_vx=args.target_vx)
+                return
+            else:
+                # Headless force mode
+                matplotlib.use("Agg")
+                output_dir = Path(args.output) if args.output else ROOT / "output"
+                run_gait_force_headless(model_path, gait_type, params,
+                                        dt=args.dt, total_cycles=args.gait_cycles,
+                                        target_vx=args.target_vx)
+                print("Done.")
+                return
+
         # Viewer mode
         if args.viewer:
-            run_gait_simulation_viewer(model_path, gait_type, params, dt=args.dt)
+            run_gait_simulation_viewer(model_path, gait_type, params,
+                                       dt=args.dt, floating=floating)
             return
 
         # Headless mode
         matplotlib.use("Agg")
         output_dir = Path(args.output) if args.output else ROOT / "output"
 
+        warm_up = 0.5 if floating else 0.2
         data = run_gait_simulation(model_path, gait_type, params,
-                                   dt=args.dt, total_cycles=args.gait_cycles)
+                                   dt=args.dt, total_cycles=args.gait_cycles,
+                                   floating=floating, warm_up=warm_up)
 
         if not args.no_plot:
             plot_gait_results(data, gait_type, output_dir)

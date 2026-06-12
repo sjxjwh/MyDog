@@ -44,19 +44,26 @@ class BodyController:
     """
 
     def __init__(self, sim: MuJoCoSim, gait_type: GaitType,
-                 params: Optional[GaitParams] = None):
+                 params: Optional[GaitParams] = None,
+                 warm_up: float = 0.2, floating: bool = False):
         """Initialize the body controller.
 
-        Sets all 12 leg joints to home configuration, computes neutral foot
-        positions via analytical FK, and creates per-leg IK controllers.
+        Sets all leg joints to home configuration, computes neutral foot
+        positions via MuJoCo FK, and creates per-leg IK controllers.
 
         Args:
-            sim: MuJoCo simulation wrapper (fixed-base model).
+            sim: MuJoCo simulation wrapper.
             gait_type: Type of gait (TROT, WALK, PACE, BOUND).
             params: Gait parameters. Uses defaults if None.
+            warm_up: Duration (seconds) to ramp step parameters from 0
+                     to target, preventing large initial IK jumps.
+            floating: If True, the model has a freejoint (body can move).
+                      Hip positions are updated each control step.
         """
         self._sim = sim
         self._params = params or GaitParams()
+        self._warm_up = warm_up
+        self._floating = floating
 
         # ── Gait scheduler & trajectory planner ──
         self._scheduler = GaitScheduler(gait_type, self._params)
@@ -70,6 +77,7 @@ class BodyController:
         # ── Set home angles and compute neutral foot positions ──
         self._neutral_foot: Dict[str, np.ndarray] = {}
         self._hip_positions: Dict[str, np.ndarray] = {}
+        self._hip_rotations: Dict[str, np.ndarray] = {}
 
         for leg in ALL_LEGS:
             ctrl = self._controllers[leg]
@@ -78,20 +86,42 @@ class BodyController:
 
         sim.forward()
 
+        # ── Floating base: lower body so feet touch the ground ──
+        if self._floating:
+            # Find the lowest foot z in world frame
+            foot_z_min = float("inf")
+            for leg in ALL_LEGS:
+                fz = self._controllers[leg].get_foot_position()[2]
+                foot_z_min = min(foot_z_min, fz)
+            # Adjust freejoint z so lowest foot is exactly on ground (z=0)
+            sim._data.qpos[2] -= foot_z_min
+            sim.forward()
+
+        # ── Neutral foot positions (hip frame) and MuJoCo offset ──
         for leg in ALL_LEGS:
             ctrl = self._controllers[leg]
-            # Neutral foot position in hip frame: use MuJoCo's actual FK,
-            # not analytical FK, because the MJCF model has link offsets
-            # (e.g., [0, -0.08, 0] thigh offset) that analytical FK ignores.
             foot_world = ctrl.get_foot_position()
             hip_pos = ctrl.get_hip_frame_position()
-            # For fixed base, R_hip = I, so hip → world is pure translation
-            foot_hip = foot_world - hip_pos
+            hip_rot = sim.get_body_rotation(f"{leg}_hip")
+
+            # Foot position in hip frame: R_hip^T @ (foot_world - hip_pos)
+            foot_hip = hip_rot.T @ (foot_world - hip_pos)
             self._neutral_foot[leg] = foot_hip
             self._hip_positions[leg] = hip_pos
+            self._hip_rotations[leg] = hip_rot
+
+            # MuJoCo-vs-analytical FK offset (constant in hip frame)
+            kin = create_go1_leg_kinematics(leg)
+            foot_analytic_hip, _ = kin.forward_kinematics(HOME_ANGLES)
+            ctrl.set_mujoco_offset(foot_hip - foot_analytic_hip)
 
         self._planner = FootTrajectoryPlanner(self._scheduler,
-                                               self._neutral_foot)
+                                               self._neutral_foot,
+                                               warm_up=self._warm_up)
+
+        # ── Floating-base state tracking ──
+        self._stance_anchor: Dict[str, np.ndarray] = {}   # world XY for stance
+        self._last_gait_state: Dict[str, str] = {leg: "stance" for leg in ALL_LEGS}
 
         # ── Recording state ──
         self._recording = False
@@ -130,6 +160,18 @@ class BodyController:
 
     # ── Core control loop ──────────────────────────────────────
 
+    def stand(self, t: float):
+        """Standing mode: hold home angles, no trajectory tracking.
+
+        Joint actuators are set directly to home angles, locking the legs
+        in place.  Much more stable than IK-based standing because it
+        eliminates the foot-sliding feedback loop.
+        """
+        for leg in ALL_LEGS:
+            ctrl = self._controllers[leg]
+            for cname, angle in zip(ctrl._ctrl_names, HOME_ANGLES):
+                self._sim.set_joint_ctrl(cname, angle)
+
     def control(self, t: float):
         """Compute and apply controls for all four legs at time t.
 
@@ -138,15 +180,49 @@ class BodyController:
           2. Transform to world frame.
           3. Solve IK and set actuator targets.
 
-        After all legs are processed, qpos reflects the IK solutions and
-        ctrl values are set for the next physics step.
+        For floating-base models, hip positions (and rotations) are refreshed
+        from the current simulation state each step.
 
         Args:
             t: Current simulation time in seconds.
         """
+        # ── Floating base: refresh hip transforms ──
+        if self._floating:
+            self._update_hip_transforms()
+
         for leg in ALL_LEGS:
-            target_hip = self._planner.get_target_hip(leg, t)
-            target_world = self._hip_positions[leg] + target_hip
+            if self._floating:
+                # ── Floating base: stance anchoring + hip-frame swing ──
+                # Stance feet are ANCHORED at their world XY touch-down position
+                # to prevent sliding.  Swing feet follow the planned hip-frame
+                # trajectory.  This is open-loop (no body velocity feedback),
+                # so the body stays roughly in place — proper locomotion requires
+                # force control (see force_controller.py).
+                gait_state = self._scheduler.leg_state(leg, t)
+                prev_state = self._last_gait_state[leg]
+
+                if gait_state == "stance":
+                    if prev_state == "swing" or leg not in self._stance_anchor:
+                        # Transition swing→stance: anchor at current world XY
+                        foot_now = self._controllers[leg].get_foot_position()
+                        self._stance_anchor[leg] = foot_now[:2].copy()
+                    target_world_xy = self._stance_anchor[leg]
+                    target_world_z = 0.0  # on ground
+                else:
+                    # Swing: hip-frame XY → world, Z lift from ground
+                    target_hip_xy = self._planner.get_target_hip_xy(leg, t)
+                    target_world_z = self._planner.get_target_world_z(leg, t)
+                    hip_pos = self._hip_positions[leg]
+                    hip_rot = self._hip_rotations[leg]
+                    target_world_xy = hip_pos[:2] + (hip_rot[:2, :2] @ target_hip_xy)
+
+                self._last_gait_state[leg] = gait_state
+                target_world = np.array([target_world_xy[0], target_world_xy[1], target_world_z])
+            else:
+                # Fixed base: full target in hip frame → world frame
+                target_hip = self._planner.get_target_hip(leg, t)
+                target_world = (self._hip_positions[leg]
+                                + self._hip_rotations[leg] @ target_hip)
 
             q_target = self._controllers[leg].control(target_world)
             if q_target is None:
@@ -158,6 +234,56 @@ class BodyController:
     def step(self):
         """Advance the simulation by one physics step."""
         self._sim.step()
+
+    def settle(self, duration: float = 0.3, dt: float = 0.002):
+        """Let body settle on ground with position control.
+
+        Two-phase approach:
+        1. Position-settle at home angles — lets PD forces reach equilibrium.
+        2. Adjust freejoint z so feet touch ground, then settle again.
+        """
+        n_steps = int(duration / dt)
+        n_half = n_steps // 2
+
+        # Phase 1: position settle
+        for _ in range(n_half):
+            for leg in ALL_LEGS:
+                ctrl = self._controllers[leg]
+                for cname, angle in zip(ctrl._ctrl_names, HOME_ANGLES):
+                    self._sim.set_joint_ctrl(cname, angle)
+            self._sim.step()
+
+        # Phase 2: lower body so feet touch ground
+        self._sim.forward()
+        foot_z_min = min(
+            self._controllers[leg].get_foot_position()[2]
+            for leg in ALL_LEGS
+        )
+        if foot_z_min > 0.002:  # feet are above ground
+            self._sim._data.qpos[2] -= foot_z_min
+            self._sim.forward()
+
+        # Phase 3: position settle again at new height
+        for _ in range(n_half):
+            for leg in ALL_LEGS:
+                ctrl = self._controllers[leg]
+                for cname, angle in zip(ctrl._ctrl_names, HOME_ANGLES):
+                    self._sim.set_joint_ctrl(cname, angle)
+            self._sim.step()
+
+        self._sim.forward()
+        self._update_hip_transforms()
+
+    def _update_hip_transforms(self):
+        """Refresh hip world positions and rotations from MuJoCo state.
+
+        Called every control step for floating-base models where the body
+        can translate and rotate during simulation.
+        """
+        for leg in ALL_LEGS:
+            hip_body = f"{leg}_hip"
+            self._hip_positions[leg] = self._sim.get_body_position(hip_body)
+            self._hip_rotations[leg] = self._sim.get_body_rotation(hip_body)
 
     # ── State queries ──────────────────────────────────────────
 
@@ -206,8 +332,15 @@ class BodyController:
         idx = self._record_step_idx
         self._record_data["time"][idx] = t
         for leg in ALL_LEGS:
-            target_hip = self._planner.get_target_hip(leg, t)
-            target_world = self._hip_positions[leg] + target_hip
+            if self._floating:
+                # For floating mode, use actual foot position as reference
+                # (target is computed dynamically in control())
+                target_world = self._controllers[leg].get_foot_position()
+                target_world[2] = 0.0  # ground level
+            else:
+                target_hip = self._planner.get_target_hip(leg, t)
+                target_world = (self._hip_positions[leg]
+                                + self._hip_rotations[leg] @ target_hip)
             actual_world = self.get_foot_position(leg)
             joint_actual = self.get_joint_angles(leg)
             # Get last IK target by reading ctrl values
