@@ -79,14 +79,14 @@ class LegTorqueController:
         J = self.jacobian_world(q)
         tau = J.T @ np.asarray(F_world)
         # Clamp torques to prevent numerical instability in MuJoCo
-        tau = np.clip(tau, -20.0, 20.0)
+        tau = np.clip(tau, -23.0, 23.0)
         for addr, t in zip(self._dof_addrs, tau):
             self._sim._data.qfrc_applied[addr] = t
 
     def apply_impedance(self, target_world: np.ndarray,
                         Kp: np.ndarray, Kd: np.ndarray,
                         ff_force: np.ndarray = None,
-                        max_force: float = 80.0):
+                        max_force: float = 150.0):
         """Impedance: F = ff + Kp*(xᵈ−x) + Kd*(vᵈ−v), then τ = Jᵀ·F."""
         x = self.get_foot_pos()
         v = self.get_foot_vel()
@@ -159,7 +159,7 @@ class MITBodyController:
         self.Kd_roll = 10.0     # roll damping
         self.Kp_pitch = 30.0    # pitch
         self.Kd_pitch = 10.0
-        self.Kp_vx   = 100.0    # forward velocity (N / (m/s))
+        self.Kp_vx   = 500.0    # forward velocity (N / (m/s))
         self.Kd_vy   = 50.0     # lateral velocity damping (N / (m/s))
         self.Kd_yaw  = 30.0     # yaw rate damping (Nm / (rad/s))
         self.target_vx = 0.3    # desired forward speed (m/s)
