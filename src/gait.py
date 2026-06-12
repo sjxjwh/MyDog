@@ -181,6 +181,7 @@ class FootTrajectoryPlanner:
         self._neutral = {leg: np.asarray(pos, dtype=float)
                          for leg, pos in neutral_foot.items()}
         self._warm_up = warm_up
+        self.target_vyaw = 0.0  # kinematic yaw rate (rad/s), set by controller
 
     @property
     def scheduler(self) -> GaitScheduler:
@@ -197,6 +198,13 @@ class FootTrajectoryPlanner:
     def get_target_hip(self, leg: str, t: float) -> np.ndarray:
         """Compute desired foot position in hip frame at time t.
 
+        Kinematic yaw: a small lateral offset is added to the neutral foot
+        position, proportional to target_vyaw. This offset is constant
+        (does NOT grow with t) — the body's actual rotation accumulates
+        naturally via the hip rotation matrix in the controller. Each step,
+        the swing foot lands at a laterally-shifted position; during stance
+        the foot is anchored there, inducing body rotation.
+
         Args:
             leg: Leg identifier ('FR', 'FL', 'RR', 'RL').
             t: Current simulation time in seconds.
@@ -206,7 +214,17 @@ class FootTrajectoryPlanner:
         """
         state = self._scheduler.leg_state(leg, t)
         s = self._scheduler.phase_in_state(leg, t)  # progress ∈ [0, 1]
-        n = self._neutral[leg]  # neutral foot position [nx, ny, nz]
+        n = self._neutral[leg].copy()  # neutral foot position [nx, ny, nz]
+
+        # ── Kinematic yaw: constant lateral offset (hip-frame Y shift) ──
+        # Positive vyaw (CCW / left turn): CoP shifts left.
+        # FR/RR: n[1] < 0 (foot right of hip); shift n[1] += offset → less right
+        # FL/RL: n[1] > 0 (foot left of hip);  shift n[1] += offset → more left
+        # Both get same-sign shift: CoP moves left → body turns CCW.
+        # NOTE: This is disabled by default (gain=0). MPC's force-based yaw
+        # is the primary mechanism. Increase gain (>0) to add kinematic turning.
+        if abs(self.target_vyaw) > 1e-6:
+            n[1] += self.target_vyaw * 0.0  # kinematic yaw gain (set >0 to enable)
 
         # Ramp parameters from 0 to target during warm-up period
         ramp = min(1.0, t / self._warm_up) if self._warm_up > 0 else 1.0

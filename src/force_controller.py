@@ -9,9 +9,41 @@ Architecture (based on MIT Cheetah / Mini Cheetah):
 All torques are applied via MuJoCo's qfrc_applied, bypassing position actuators.
 """
 
+import ctypes
+import ctypes.util
+import signal
 from typing import Dict
 
 import numpy as np
+
+# ── SIGFPE guard for MuJoCo mj_step calls ────────────────────────────────────
+# MuJoCo can trigger SIGFPE on certain configurations (intermittent on WSL2).
+
+_libm = ctypes.CDLL(ctypes.util.find_library("m"))
+_FE_ALL_EXCEPT = 0x01 | 0x04 | 0x08 | 0x10 | 0x20  # FE_INVALID|DIVBYZERO|OVERFLOW|UNDERFLOW|INEXACT
+
+
+class _MuJoCoFPE(FloatingPointError):
+    pass
+
+
+def _sigfpe_handler(signum, frame):
+    raise _MuJoCoFPE("MuJoCo triggered SIGFPE")
+
+
+def _step_safe(sim) -> bool:
+    """Call sim.step() — returns False if MuJoCo triggers SIGFPE."""
+    prev_fe = _libm.fegetexcept()
+    _libm.fedisableexcept(_FE_ALL_EXCEPT)
+    prev_sig = signal.signal(signal.SIGFPE, _sigfpe_handler)
+    try:
+        sim.step()
+        return True
+    except _MuJoCoFPE:
+        return False
+    finally:
+        signal.signal(signal.SIGFPE, prev_sig)
+        _libm.feenableexcept(prev_fe)
 
 from .controller import IKFootController, create_go1_leg_kinematics
 from .gait import ALL_LEGS, GaitParams, GaitScheduler, FootTrajectoryPlanner
@@ -69,17 +101,30 @@ class LegTorqueController:
     def get_hip_rot(self) -> np.ndarray:
         return self._sim.get_body_rotation(f"{self._leg}_hip")
 
-    def jacobian_world(self, q: np.ndarray) -> np.ndarray:
-        """3×3 Jacobian: q̇ → foot velocity in WORLD frame."""
-        return self.get_hip_rot() @ self._kin.jacobian(q)
+    def jacobian_world(self, q: np.ndarray = None) -> np.ndarray:
+        """3×3 Jacobian: q̇ → foot velocity in WORLD frame.
+
+        Uses MuJoCo's built-in mj_jacSite for EXACT Jacobian, accounting for
+        the thigh lateral offset [0, ±0.08, 0] that the analytical FK misses.
+        """
+        import mujoco
+        site_id = self._sim._site_ids[self._ik._foot_site_name]
+        nv = self._sim._model.nv
+        jacp = np.zeros((3, nv))
+        jacr = np.zeros((3, nv))
+        mujoco.mj_jacSite(self._sim._model, self._sim._data, jacp, jacr, site_id)
+        # Extract 3×3 submatrix for our 3 leg joints
+        J = np.zeros((3, 3))
+        for i, dof_addr in enumerate(self._dof_addrs):
+            J[:, i] = jacp[:, dof_addr]
+        return J
 
     def apply_force(self, F_world: np.ndarray):
         """Apply torque τ = Jᵀ · F to achieve foot force F in world frame."""
-        q = self._ik.get_current_joint_angles()
-        J = self.jacobian_world(q)
+        J = self.jacobian_world()
         tau = J.T @ np.asarray(F_world)
         # Clamp torques to prevent numerical instability in MuJoCo
-        tau = np.clip(tau, -23.0, 23.0)
+        tau = np.clip(tau, -35.0, 35.0)
         for addr, t in zip(self._dof_addrs, tau):
             self._sim._data.qfrc_applied[addr] = t
 
@@ -160,9 +205,11 @@ class MITBodyController:
         self.Kp_pitch = 30.0    # pitch
         self.Kd_pitch = 10.0
         self.Kp_vx   = 500.0    # forward velocity (N / (m/s))
-        self.Kd_vy   = 50.0     # lateral velocity damping (N / (m/s))
-        self.Kd_yaw  = 30.0     # yaw rate damping (Nm / (rad/s))
+        self.Kp_vy   = 50.0     # lateral velocity PD (N / (m/s))
+        self.Kp_yaw  = 30.0     # yaw rate PD (Nm / (rad/s))
         self.target_vx = 0.3    # desired forward speed (m/s)
+        self.target_vy = 0.0    # desired lateral speed (m/s)
+        self.target_vyaw = 0.0  # desired yaw rate (rad/s)
 
         # Stance / swing gains
         self._stance_Kp = np.array([150.0, 150.0, 500.0])
@@ -208,81 +255,61 @@ class MITBodyController:
             self._sim.step()
         self._sim.forward()
 
-    # ── Main control loop ─────────────────────────────────────────────────
+    # ── Body PD wrench computation ─────────────────────────────────────────
 
-    def control(self, t: float):
+    def _compute_body_pd_wrench(self, t: float) -> Dict[str, np.ndarray]:
+        """Compute body PD wrench and distribute to stance feet.
+
+        Returns:
+            Dict mapping stance leg name → GRF [Fx, Fy, Fz] in world frame.
+            Empty dict if no stance legs.
+        """
         pos, quat, vel, angvel, roll, pitch, yaw = self._body_state()
 
-        # ── Body PD: desired wrench (force + torque on trunk) ──
         target_height = 0.28
-        target_vx = self.target_vx
 
-        # Vertical force (world Z).  Negative = push foot DOWN into ground.
-        # Base: -weight/n supports body.  PD: if body too high, reduce support
-        # (add positive → less negative); if too low, increase support.
         Fz = -TOTAL_WEIGHT \
              + self.Kp_z * (pos[2] - target_height) \
              - self.Kd_z * vel[2]
 
-        # Roll / pitch torque (disabled for initial tuning)
+        # ── Translational forces ──
+        Fx = -self.Kp_vx * (self.target_vx - vel[0])
+        Fy = -self.Kp_vy * (self.target_vy - vel[1])
+
+        # ── Moments ──
+        # Roll/pitch: disabled (impedance layer handles body-level angular
+        # stability through foot placement — same as original code).
+        # Yaw: PD tracking around target yaw rate
         Mx = 0.0
         My = 0.0
+        Mz = -self.Kp_yaw * (self.target_vyaw - angvel[2])
 
-        # Yaw torque: damp angular velocity around Z (prevent drifting yaw)
-        Mz = -self.Kd_yaw * angvel[2]
-
-        # Forward force: velocity tracking.
-        # To move body forward, foot pushes BACKWARD on ground
-        # → Fx at foot is NEGATIVE (backward).  Reaction pushes body forward.
-        Fx = -self.Kp_vx * (target_vx - vel[0])
-
-        # Lateral force: damp sideways velocity
-        Fy = -self.Kd_vy * vel[1]
-
-        # ── Force distribution to stance feet ──
         stance = self._scheduler.get_stance_legs(t)
         n = max(1, len(stance))
 
-        # Build contact matrix: each stance leg contributes to body wrench
-        # f_i = [fx_i, fy_i, fz_i] at foot position p_i.
-        # Body wrench = Σ [f_i; (p_i − com) × f_i]
-        com = pos.copy()
-        F_alloc = np.zeros(3)  # [Fx, Fy, Fz] distributed
-        M_alloc = np.zeros(3)  # [Mx, My, Mz] distributed
-
-        # Simple equal distribution for Fz + height PD, then handle roll/pitch
         foot_forces: Dict[str, np.ndarray] = {}
 
-        hip_positions = {}
-        for leg in stance:
-            hip_positions[leg] = self._ctrls[leg].get_hip_pos()
-
-        # Compute foot positions and COM
         stance_feet = []
         for leg in stance:
             p = self._ctrls[leg].get_foot_pos()
             stance_feet.append((leg, p))
 
         if len(stance_feet) == 0:
-            return
+            return foot_forces
 
-        # ── Simple QP-free allocation ──
-        # Each stance leg gets: 1/n of Fz, 1/n of Fx
-        # Roll/pitch moments distributed to left/right and front/rear legs
+        # ── Even force distribution ──
+        com = pos.copy()
         for leg, p_foot in stance_feet:
-            r = p_foot - com  # vector from COM to foot
             f = np.zeros(3)
-            f[0] = Fx / n                      # forward push
-            f[1] = Fy / n                      # lateral damping
-            f[2] = Fz / n                      # vertical support
+            f[0] = Fx / n
+            f[1] = Fy / n
+            f[2] = Fz / n
             foot_forces[leg] = f
 
-        # Roll moment → differential vertical force on left vs right
-        # Left legs: FL, RL (y > 0). Right legs: FR, RR (y < 0).
+        # ── Roll: differential Fz on left vs right ──
         left_legs  = [l for l in stance if l[1] == 'L']
         right_legs = [l for l in stance if l[1] == 'R']
         if left_legs and right_legs:
-            # Track width ~0.094m
             width = 0.094
             dfz_roll = Mx / width / len(left_legs)
             for leg in left_legs:
@@ -290,11 +317,10 @@ class MITBodyController:
             for leg in right_legs:
                 foot_forces[leg][2] += dfz_roll
 
-        # Pitch moment → differential vertical force on front vs rear
+        # ── Pitch: differential Fz on front vs rear ──
         front_legs = [l for l in stance if l[0] == 'F']
         rear_legs  = [l for l in stance if l[0] == 'R']
         if front_legs and rear_legs:
-            # Wheelbase ~0.376m
             wheelbase = 0.376
             dfz_pitch = My / wheelbase / len(front_legs)
             for leg in front_legs:
@@ -302,38 +328,43 @@ class MITBodyController:
             for leg in rear_legs:
                 foot_forces[leg][2] -= dfz_pitch
 
-        # Yaw moment → differential forward force on left vs right
+        # ── Yaw: differential Fx on left vs right ──
         if left_legs and right_legs:
-            # For yaw, left legs push forward (+Fx) while right legs push
-            # backward (-Fx), creating a positive Mz (counterclockwise from top).
+            width = 0.094
             dfx_yaw = Mz / width / len(left_legs)
             for leg in left_legs:
                 foot_forces[leg][0] += dfx_yaw
             for leg in right_legs:
                 foot_forces[leg][0] -= dfx_yaw
 
-        # Ensure minimum vertical force (no pulling upward on foot)
+        # ── Final clipping ──
         for leg in foot_forces:
-            foot_forces[leg][2] = max(foot_forces[leg][2], -200.0)  # max downward = 200N
-            foot_forces[leg][2] = min(foot_forces[leg][2], 0.0)     # no upward pull
+            foot_forces[leg][2] = max(foot_forces[leg][2], -200.0)
+            foot_forces[leg][2] = min(foot_forces[leg][2], 0.0)
 
-        # ── Apply torques ──
-        ramp = min(1.0, t / self._warm_up)
+        return foot_forces
 
+    # ── Apply impedance with feed-forward forces ───────────────────────────
+
+    def _apply_leg_impedance(self, t: float,
+                             foot_forces: Dict[str, np.ndarray]):
+        """Apply per-leg impedance control with optional feed-forward force.
+
+        Stance: τ = Jᵀ·(F_ff + Kp·Δx - Kd·v)  at z=0
+        Swing:  τ = Jᵀ·(Kp·Δx - Kd·v)  tracking hip-frame trajectory
+        """
         for leg in ALL_LEGS:
             ctrl = self._ctrls[leg]
             ctrl.clear()
             state = self._scheduler.leg_state(leg, t)
 
             if state == "stance" and leg in foot_forces:
-                # Stance: impedance around ground contact + feed-forward GRF
                 target = ctrl.get_foot_pos().copy()
                 target[2] = 0.0
                 ff = foot_forces[leg]
                 ctrl.apply_impedance(target, self._stance_Kp, self._stance_Kd,
                                      ff_force=ff)
             else:
-                # Swing: track trajectory
                 target_hip_xy = self._planner.get_target_hip_xy(leg, t)
                 target_world_z = self._planner.get_target_world_z(leg, t)
                 h_pos = ctrl.get_hip_pos()
@@ -342,5 +373,178 @@ class MITBodyController:
                 target = np.array([xy_world[0], xy_world[1], target_world_z])
                 ctrl.apply_impedance(target, self._swing_Kp, self._swing_Kd)
 
+    # ── Main control loop ─────────────────────────────────────────────────
+
+    def control(self, t: float):
+        """Run one control step: Body PD → force distribution → impedance."""
+        # Sync kinematic yaw target to foot trajectory planner
+        self._planner.target_vyaw = self.target_vyaw
+        foot_forces = self._compute_body_pd_wrench(t)
+        self._apply_leg_impedance(t, foot_forces)
+
     def step(self):
         self._sim.step()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MPC + MIT Impedance Controller
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MPCMITBodyController(MITBodyController):
+    """MPC-based locomotion controller with MIT impedance control.
+
+    Replaces the Body PD force distribution with SRB convex MPC:
+      - MPC runs at ~31 Hz (every 16 sim steps at dt=0.002s)
+      - MPC optimizes GRFs over a 0.3s horizon subject to SRB dynamics
+        and friction cone constraints
+      - Output GRFs are cached and fed as ff_force into the impedance layer
+      - Swing legs continue with pure impedance trajectory tracking
+
+    Falls back to Body PD if MPC QP fails to solve.
+
+    Control law (per leg):
+      τ = Jᵀ · (F_mpc + Kp · Δx - Kd · v)      [stance, MIT impedance]
+      τ = Jᵀ · (Kp · Δx - Kd · v)               [swing, pure impedance]
+    """
+
+    # MPC runs every MPC_DECIMATION steps (16 steps × 0.002s = 0.032s ≈ 31 Hz)
+    MPC_DECIMATION = 16
+
+    def __init__(self, sim, gait_type, params=None, warm_up: float = 0.3):
+        super().__init__(sim, gait_type, params, warm_up)
+
+        # ── Softer stance gains for MPC (feed-forward handles most of the load) ──
+        self._stance_Kp = np.array([80.0, 80.0, 200.0])
+        self._stance_Kd = np.array([5.0, 5.0, 10.0])
+
+        # ── Build SRB MPC solver ──
+        from .mpc_controller import SrbMpcSolver
+
+        # Hip offsets relative to trunk CoM (body frame)
+        hip_offsets = {}
+        for leg in ALL_LEGS:
+            # Neutral hip position in body frame (computed at init)
+            hip_offsets[leg] = self._neutral[leg].copy()
+
+        self._mpc = SrbMpcSolver(
+            mass=GO1_MASS,
+            inertia_body=TRUNK_I,
+            hip_offsets_com=hip_offsets,
+            N=10, dt_mpc=0.03, mu=0.6,
+            fz_min=30.0, fz_max=150.0,
+        )
+
+        # ── MPC state ──
+        self._mpc_forces: Dict[str, np.ndarray] = {
+            leg: np.zeros(3) for leg in ALL_LEGS
+        }
+        self._mpc_counter: int = 0
+        self._mpc_fallback_count: int = 0
+        self._mpc_total_count: int = 0
+        self._mpc_solve_time: float = 0.0
+
+        # ── MPC target velocities ──
+        self.target_vy = 0.0
+        self.target_vyaw = 0.0
+        self.target_height = 0.28
+
+    def control(self, t: float):
+        """Run one control step with MPC + MIT impedance."""
+        # Sync kinematic yaw target to foot trajectory planner
+        self._planner.target_vyaw = self.target_vyaw
+        step = self._mpc_counter
+
+        # ── Run MPC at decimated rate (skip first few steps for stability) ──
+        if step >= 8 and step % self.MPC_DECIMATION == 0:
+            self._run_mpc(t)
+        elif step < 8:
+            # Startup: use Body PD for initial support
+            pd = self._compute_body_pd_wrench(t)
+            for leg in ALL_LEGS:
+                if leg in pd:
+                    self._mpc_forces[leg] = pd[leg]
+                else:
+                    self._mpc_forces[leg] = np.zeros(3)
+
+        self._mpc_counter += 1
+
+        # ── Apply impedance with MPC forces (or fallback) ──
+        self._apply_leg_impedance(t, self._mpc_forces)
+
+    def _run_mpc(self, t: float):
+        """Solve MPC QP and cache GRF forces."""
+        import time as _time
+
+        # ── Get current body state ──
+        pos, quat, vel, angvel, roll, pitch, yaw = self._body_state()
+        x0 = np.array([roll, pitch, yaw,
+                       pos[0], pos[1], pos[2],
+                       angvel[0], angvel[1], angvel[2],
+                       vel[0], vel[1], vel[2]])
+
+        # ── Get foot positions in world frame ──
+        foot_positions = {}
+        for leg in ALL_LEGS:
+            foot_positions[leg] = self._ctrls[leg].get_foot_pos()
+
+        # ── Contact schedule over horizon ──
+        contact = self._mpc.compute_contact_schedule(t, self._scheduler)
+
+        # ── Reference trajectory ──
+        X_ref = self._mpc.build_reference(
+            x0,
+            target_vx=self.target_vx,
+            target_vy=self.target_vy,
+            target_vyaw=self.target_vyaw,
+            target_height=self.target_height,
+        )
+
+        # ── Solve MPC ──
+        t0 = _time.perf_counter()
+        try:
+            u_opt = self._mpc.solve(
+                x0, X_ref, foot_positions,
+                com_position=pos, yaw=yaw, contact=contact,
+            )
+        except Exception:
+            u_opt = None
+        elapsed = _time.perf_counter() - t0
+        self._mpc_solve_time = elapsed
+        self._mpc_total_count += 1
+
+        if u_opt is not None:
+            # MPC outputs ground reaction forces (GRF: ground→foot).
+            # Impedance controller expects foot→ground forces (opposite sign).
+            # Negate to match the impedance convention.
+            mpc_forces = self._mpc.forces_to_dict(u_opt)
+            max_ff = 200.0  # clip per-component feed-forward to safe range
+            for leg in ALL_LEGS:
+                f = -mpc_forces[leg]
+                if not np.all(np.isfinite(f)):
+                    f = np.zeros(3)
+                f = np.clip(f, -max_ff, max_ff)
+                # Ensure downward force (no upward pull on foot)
+                f[2] = min(f[2], 0.0)
+                f[2] = max(f[2], -max_ff)
+                self._mpc_forces[leg] = f
+        else:
+            # Fallback to Body PD
+            self._mpc_fallback_count += 1
+            pd_forces = self._compute_body_pd_wrench(t)
+            # Merge: MPC fails → use PD, keep swing legs zero
+            for leg in ALL_LEGS:
+                if leg in pd_forces:
+                    self._mpc_forces[leg] = pd_forces[leg]
+                else:
+                    self._mpc_forces[leg] = np.zeros(3)
+
+    @property
+    def mpc_stats(self) -> dict:
+        """Return MPC runtime statistics."""
+        return {
+            "solve_time_ms": self._mpc_solve_time * 1000,
+            "fallback_count": self._mpc_fallback_count,
+            "total_count": self._mpc_total_count,
+            "fallback_rate": (self._mpc_fallback_count
+                              / max(1, self._mpc_total_count)),
+        }
