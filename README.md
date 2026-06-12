@@ -144,19 +144,23 @@ MPC 每 31Hz 求解 10 步时域 QP，输出最优 GRF 馈入阻抗控制器。
 Body PD 作为 fallback（QP 失败时自动切换）。
 
 ```bash
-# MPC 图形化（推荐参数：T=0.25s, L=0.22m — 短周期大步长）
+# MPC 纯前进（Trot 或 Pace 最佳）
 python3 -m src.main --gait --float --force --mpc --viewer --gait-type trot \
     --gait-T 0.25 --step-length 0.22 --target-vx 0.3
 
-# MPC 无头 — 前进+侧向速度跟踪
-python3 -m src.main --gait --float --force --mpc --gait-type trot \
+# MPC 前进+侧向（Pace 最佳 — vy 效率翻倍！）
+python3 -m src.main --gait --float --force --mpc --viewer --gait-type pace \
+    --gait-T 0.25 --step-length 0.22 --target-vx 0.3 --target-vy 0.2
+
+# MPC 纯侧向（Walk 最佳）
+python3 -m src.main --gait --float --force --mpc --gait-type walk \
+    --gait-T 0.25 --step-length 0.22 --target-vx 0 --target-vy 0.2 \
+    --gait-cycles 8
+
+# MPC 无头 — 对比三种步态
+python3 -m src.main --gait --float --force --mpc --gait-type pace \
     --gait-T 0.25 --step-length 0.22 \
     --target-vx 0.3 --target-vy 0.2 --gait-cycles 8
-
-# 纯侧向运动测试
-python3 -m src.main --gait --float --force --mpc --gait-type trot \
-    --gait-T 0.25 --step-length 0.22 \
-    --target-vx 0.0 --target-vy 0.2 --gait-cycles 8
 ```
 
 ### 命令行参数
@@ -295,15 +299,38 @@ SRB（单刚体）凸 MPC，纯数值求解（不依赖 MuJoCo）：
 
 ### 速度跟踪性能
 
-| 目标 | 实际 vx | 实际 vy | 效率 | 说明 |
-|------|---------|---------|------|------|
-| vx=0.3, vy=0.0 | 0.207 | -0.000 | 69% | MPC 推荐参数 |
-| vx=0.0, vy=0.2 | 0.052 | 0.087 | 44% | 侧向有前向耦合 |
-| vx=0.3, vy=0.2 | 0.207 | 0.068 | vx=69%, vy=34% | 组合侧向效率下降 |
+**Trot 步态 (T=0.25, L=0.22)**：
 
-**速度瓶颈**：MuJoCo 接触阻尼 (~142 N·s/m) + Jᵀ 传输效率 (~71%)。T_cycle 是第一优先调优参数（T=0.25 → 2x 提速 vs T=0.5）。MPC Q 权重和 stance 阻抗对稳态速度影响极小。
+| 目标 | 实际 vx | 实际 vy | 实际 wz | 效率 |
+|------|---------|---------|---------|------|
+| vx=0.3 | 0.207 | -0.000 | -0.000 | 69% |
+| vy=0.2 | 0.052 | 0.087 | +0.055 | 44% |
+| vyaw=0.5 | 0.047 | -0.004 | 0.005 | 1% |
+| vx+vy | 0.207 | 0.068 | +0.043 | vx=69%, vy=34% |
 
-**偏航局限**：SRB 力差动偏航效率 <2%（trot 对角支撑腿力矩相消）。运动学偏航机制已预留（`gait.py` target_vyaw，默认 gain=0），待后续开发。
+**步态对比 — 不同方向需要不同步态！**
+
+Trot 的对角支撑腿在侧向/偏航时力矩相消。切换步态可大幅改善：
+
+| 目标 | 指标 | Trot | Pace | Walk | 最佳 |
+|------|------|------|------|------|------|
+| vx=0.3 | vx | 0.207 (69%) | 0.216 (72%) | 0.190 (63%) | Pace |
+| vy=0.2 | vy | 0.087 (43%) | 0.105 (52%) | **0.113 (56%)** | Walk |
+| vyaw=0.5 | wz | 0.005 (1%) | 0.003 (1%) | **0.053 (11%)** | Walk |
+| vx+vy | vy | 0.068 (34%) | **0.122 (61%)** | 0.110 (55%) | **Pace** |
+
+**分析**：
+- **Pace（同侧同步）**：组合 vx+vy 时 vy 效率翻倍（34%→61%），vx 不受影响。同侧腿朝同一方向推，无力矩抵消。
+- **Walk（波形，3 足着地）**：纯侧向最优（56%），偏航提升 10x（1%→11%），但 vx 略低。
+- **Vyaw 根本性局限**：即使最佳步态也仅 11%，力控偏航在 MuJoCo 接触模型下无法解决。
+
+**推荐策略**：
+- 前进为主 → `--gait-type trot` 或 `pace`
+- 前进+侧向 → `--gait-type pace`（vy 翻倍）
+- 纯侧向 → `--gait-type walk`
+- 偏航 → 需运动学方案（落脚点偏移），力控已穷尽
+
+**调优优先级**：T_cycle >> Gait type > step_length >> MPC Q 权重（几乎无影响）
 
 ### 步态系统 (`gait.py`)
 
