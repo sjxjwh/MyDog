@@ -752,6 +752,8 @@ def run_gait_force_headless(model_path: str, gait_type: GaitType,
                   f"pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] "
                   f"vel=[{vel[0]:.3f}, {vel[1]:.3f}, {vel[2]:.3f}]")
 
+    # Print velocity tracking summary
+    mc._metrics.print_summary()
     print("Simulation complete.\n")
 
 
@@ -912,6 +914,200 @@ def run_gait_mpc_headless(model_path: str, gait_type: GaitType,
     print(f"\nMPC stats: avg solve {stats['solve_time_ms']:.1f}ms, "
           f"fallbacks {stats['fallback_count']}/{stats['total_count']} "
           f"({stats['fallback_rate']:.1%})")
+    mc._metrics.print_summary()
+    print("Simulation complete.\n")
+
+
+def run_gait_quintic_viewer(model_path: str, gait_type: GaitType,
+                             params: GaitParams, dt: float = 0.002,
+                             target_vx: float = 0.3, target_vy: float = 0.0,
+                             target_vyaw: float = 0.0,
+                             mu_max: float = 0.6, adapt_params: bool = False,
+                             use_momentum: bool = False):
+    """Run quintic + friction/momentum-controlled gait simulation with MuJoCo viewer.
+
+    Uses QuinticFrictionController or MomentumController.
+    """
+    import mujoco.viewer
+    from .force_controller import QuinticFrictionController, MomentumController
+
+    ctrl_name = "Momentum" if use_momentum else "Quintic + Friction"
+    print(f"\n{'='*60}")
+    print(f"  MyDog — {ctrl_name} Gait Viewer")
+    print(f"  Gait: {gait_type.value}, T_cycle={params.T_cycle:.2f}s, "
+          f"duty={params.duty_factor:.2f}")
+    print(f"  Step length={params.step_length:.3f}m, "
+          f"step height={params.step_height:.3f}m")
+    print(f"  Target vx={target_vx:.2f}, vy={target_vy:.2f}, "
+          f"vyaw={target_vyaw:.2f}")
+    print(f"  μ_max={mu_max}, adapt_params={adapt_params}")
+    print(f"{'='*60}\n")
+    print("Controls: Space=pause, Scroll=zoom, Right-drag=rotate, "
+          "Ctrl+Right-drag=pan\n")
+
+    # Load model and data directly
+    model = mujoco.MjModel.from_xml_path(model_path)
+    data = mujoco.MjData(model)
+
+    # Create sim wrapper
+    sim = MuJoCoSim.__new__(MuJoCoSim)
+    sim._model = model
+    sim._data = data
+    sim.model_path = Path(model_path)
+    sim._body_ids = {}
+    sim._joint_ids = {}
+    sim._actuator_ids = {}
+    sim._site_ids = {}
+    sim._build_name_index()
+
+    # Create controller
+    cls = MomentumController if use_momentum else QuinticFrictionController
+    mc = cls(sim, gait_type, params, mu_max=mu_max, adapt_params=adapt_params)
+    mc.target_vx = target_vx
+    mc.target_vy = target_vy
+    mc.target_vyaw = target_vyaw
+    print(f"Body mass: {GO1_MASS:.1f} kg, weight: {GO1_MASS * 9.81:.0f} N")
+    print(f"Controller ready.\n")
+
+    # Settle body on ground using position control
+    print("Settling body on ground (0.5s)...")
+    mc.settle(duration=0.5, dt=dt)
+
+    # Substep count
+    viewer_fps = 60.0
+    substeps = max(1, int(1.0 / (dt * viewer_fps)))
+    print(f"Viewer substeps: {substeps} (dt={dt}s, fps≈{viewer_fps})\n")
+
+    # Launch viewer
+    t = 0.0
+    cycle_count = 0
+    last_cycle = -1
+
+    with mujoco.viewer.launch_passive(model, data) as viewer:
+        while viewer.is_running():
+            for _ in range(substeps):
+                mc.control(t)
+                mujoco.mj_step(model, data)
+                t += dt
+
+            viewer.sync()
+
+            # Log cycle progress with stats
+            current_cycle = int(t / params.T_cycle)
+            if current_cycle > last_cycle:
+                last_cycle = current_cycle
+                if current_cycle % 5 == 0:
+                    pos = data.qpos[0:3]
+                    vel = data.qvel[0:3]
+                    fstats = mc.friction_stats
+                    if 'mu_utilized' in fstats:
+                        print(f"  Cycle {current_cycle} (t={t:.1f}s) — "
+                              f"pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] "
+                              f"vel=[{vel[0]:.3f}, {vel[1]:.3f}, {vel[2]:.3f}] "
+                              f"μ={fstats['mu_utilized']:.2f} "
+                              f"α={fstats['nullspace_alpha']:.1f} "
+                              f"{'✓' if fstats['feasible'] else '⚠'}")
+                    else:
+                        cond_str = f"cond={fstats['cond_A']:.0f}" \
+                            if fstats.get('cond_A') is not None else ""
+                        print(f"  Cycle {current_cycle} (t={t:.1f}s) — "
+                              f"pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] "
+                              f"vel=[{vel[0]:.3f}, {vel[1]:.3f}, {vel[2]:.3f}] "
+                              f"μ={fstats['mu_max_used']:.2f} {cond_str} "
+                              f"{'✓' if fstats['feasible'] else '⚠'}")
+
+    print("Viewer closed.\n")
+
+
+def run_gait_quintic_headless(model_path: str, gait_type: GaitType,
+                               params: GaitParams, dt: float = 0.002,
+                               total_cycles: float = 5.0,
+                               target_vx: float = 0.3, target_vy: float = 0.0,
+                               target_vyaw: float = 0.0,
+                               mu_max: float = 0.6, adapt_params: bool = False,
+                               use_momentum: bool = False):
+    """Run quintic + friction/momentum gait simulation (headless mode)."""
+    from .force_controller import QuinticFrictionController, MomentumController
+
+    ctrl_name = "Momentum" if use_momentum else "Quintic + Friction"
+    print(f"\n{'='*60}")
+    print(f"  MyDog — {ctrl_name} Gait [headless]")
+    print(f"  Gait: {gait_type.value}, T_cycle={params.T_cycle:.2f}s, "
+          f"duty={params.duty_factor:.2f}")
+    print(f"  Target vx={target_vx:.2f}, vy={target_vy:.2f}, "
+          f"vyaw={target_vyaw:.2f}")
+    print(f"  μ_max={mu_max}, adapt_params={adapt_params}")
+    print(f"  Model: {model_path}")
+    print(f"{'='*60}\n")
+
+    # Load model
+    sim = MuJoCoSim(model_path)
+    print(f"Model loaded: {sim.nq} qpos, {sim.nv} qvel, {sim.nu} actuators")
+
+    # Create controller
+    cls = MomentumController if use_momentum else QuinticFrictionController
+    mc = cls(sim, gait_type, params, mu_max=mu_max, adapt_params=adapt_params)
+    mc.target_vx = target_vx
+    mc.target_vy = target_vy
+    mc.target_vyaw = target_vyaw
+    print(f"Body mass: {GO1_MASS:.1f} kg, weight: {GO1_MASS * 9.81:.0f} N")
+
+    # Settle
+    print("Settling body on ground (0.5s)...")
+    mc.settle(duration=0.5, dt=dt)
+
+    # Run
+    T_total = total_cycles * params.T_cycle
+    total_steps = int(T_total / dt)
+    print(f"\nSimulating {total_cycles:.1f} cycles ({T_total:.1f}s) "
+          f"at dt={dt}s → {total_steps} steps")
+
+    print("Running simulation...")
+    for step_idx in range(total_steps):
+        t = step_idx * dt
+        mc.control(t)
+        mc.step()
+
+        if step_idx % 500 == 0:
+            pos = sim._data.qpos[0:3]
+            vel = sim._data.qvel[0:3]
+            fstats = mc.friction_stats
+            if 'mu_utilized' in fstats:
+                print(f"  Step {step_idx}/{total_steps}: "
+                      f"pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] "
+                      f"vel=[{vel[0]:.3f}, {vel[1]:.3f}, {vel[2]:.3f}] "
+                      f"μ={fstats['mu_utilized']:.2f} "
+                      f"α={fstats['nullspace_alpha']:.1f} "
+                      f"T={fstats['T_cycle']:.3f} L={fstats['step_length']:.3f}")
+            else:
+                cond_str = f"cond={fstats['cond_A']:.0f}" \
+                    if fstats.get('cond_A') is not None else ""
+                print(f"  Step {step_idx}/{total_steps}: "
+                      f"pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] "
+                      f"vel=[{vel[0]:.3f}, {vel[1]:.3f}, {vel[2]:.3f}] "
+                      f"μ={fstats['mu_max_used']:.2f} {cond_str} "
+                      f"T={fstats['T_cycle']:.3f} L={fstats['step_length']:.3f}")
+
+    # Final stats
+    fstats = mc.friction_stats
+    pos = sim._data.qpos[0:3]
+    vel = sim._data.qvel[0:3]
+    print(f"\nFinal state: "
+          f"pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] "
+          f"vel=[{vel[0]:.3f}, {vel[1]:.3f}, {vel[2]:.3f}]")
+    if 'mu_utilized' in fstats:
+        print(f"Friction stats: μ_utilized={fstats['mu_utilized']:.3f}, "
+              f"feasible={fstats['feasible']}, "
+              f"α={fstats['nullspace_alpha']:.3f}")
+    else:
+        cond_str = f", cond_A={fstats['cond_A']:.1f}" \
+            if fstats.get('cond_A') is not None else ""
+        print(f"Momentum stats: μ_max={fstats['mu_max_used']:.3f}, "
+              f"feasible={fstats['feasible']}{cond_str}")
+    if adapt_params:
+        print(f"Adapted params: T_cycle={fstats['T_cycle']:.3f}s, "
+              f"step_length={fstats['step_length']:.3f}m")
+    mc._metrics.print_summary()
     print("Simulation complete.\n")
 
 
@@ -1072,6 +1268,19 @@ def main():
     parser.add_argument("--mpc", action="store_true",
                         help="Use SRB convex MPC + MIT impedance control. "
                              "Only valid with --force --gait --float.")
+    parser.add_argument("--quintic", action="store_true",
+                        help="Use quintic trajectory + static friction force control. "
+                             "Only valid with --force --gait --float. "
+                             "Mutually exclusive with --mpc.")
+    parser.add_argument("--mu-max", type=float, default=0.6,
+                        help="Maximum static friction coefficient for "
+                             "force distribution (default: 0.6)")
+    parser.add_argument("--adapt-params", action="store_true",
+                        help="Enable online gait parameter adaptation (Tier 1). "
+                             "Only valid with --quintic.")
+    parser.add_argument("--momentum", action="store_true",
+                        help="Use momentum-based 6×6 Newton-Euler force distribution. "
+                             "Only valid with --quintic --force --gait --float.")
     args = parser.parse_args()
 
     # Determine model path
@@ -1094,16 +1303,33 @@ def main():
         if floating and not args.model:
             model_path = str(SCENE_PATH)
 
-        # ── Force control mode (MIT-style or MPC) ──
+        # ── Force control mode (MIT-style, MPC, or Quintic) ──
         if args.force:
             if not floating:
                 print("Error: --force requires --float (floating-base model)")
                 sys.exit(1)
 
             use_mpc = args.mpc
+            use_quintic = args.quintic
+
+            if use_mpc and use_quintic:
+                print("Error: --quintic and --mpc are mutually exclusive")
+                sys.exit(1)
+
+            if args.momentum and not use_quintic:
+                print("Error: --momentum requires --quintic")
+                sys.exit(1)
 
             if args.viewer:
-                if use_mpc:
+                if use_quintic:
+                    run_gait_quintic_viewer(model_path, gait_type, params,
+                                            dt=args.dt, target_vx=args.target_vx,
+                                            target_vy=args.target_vy,
+                                            target_vyaw=args.target_vyaw,
+                                            mu_max=args.mu_max,
+                                            adapt_params=args.adapt_params,
+                                            use_momentum=args.momentum)
+                elif use_mpc:
                     run_gait_mpc_viewer(model_path, gait_type, params,
                                         dt=args.dt, target_vx=args.target_vx,
                                         target_vy=args.target_vy,
@@ -1118,7 +1344,16 @@ def main():
                 # Headless force mode
                 matplotlib.use("Agg")
                 output_dir = Path(args.output) if args.output else ROOT / "output"
-                if use_mpc:
+                if use_quintic:
+                    run_gait_quintic_headless(model_path, gait_type, params,
+                                              dt=args.dt, total_cycles=args.gait_cycles,
+                                              target_vx=args.target_vx,
+                                              target_vy=args.target_vy,
+                                              target_vyaw=args.target_vyaw,
+                                              mu_max=args.mu_max,
+                                              adapt_params=args.adapt_params,
+                                              use_momentum=args.momentum)
+                elif use_mpc:
                     run_gait_mpc_headless(model_path, gait_type, params,
                                           dt=args.dt, total_cycles=args.gait_cycles,
                                           target_vx=args.target_vx,

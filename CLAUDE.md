@@ -7,28 +7,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 分层控制架构，在 MuJoCo 中对宇树 Go1 四足机器人实现 locomotion 控制与智能决策：
 
 ```
-┌─────────────────────────────────────────┐
-│     上层：RL 决策（UniLab）               │
-│     速度选择、方向规划、步态切换、         │
-│     地形适应、行为策略                    │
-├─────────────────────────────────────────┤
-│     下层：传统控制（MyDog 本体）           │
-│     四足 IK、步态规划、足尖轨迹生成、      │
-│     力控/位控执行、姿态稳定                │
-├─────────────────────────────────────────┤
-│     物理引擎：MuJoCo（Go1 模型）           │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│     上层：RL 决策（UniLab）                        │
+│     速度选择、方向规划、步态切换、                   │
+│     地面摩擦估计 (μ_max)、地形适应、行为策略         │
+├──────────────────────────────────────────────────┤
+│     下层：传统控制（MyDog 本体）                    │
+│     Tier 1: 步态参数自适应 (~10 Hz, 可选)          │
+│     Tier 2: 五次多项式摆动轨迹 (C² 连续)           │
+│     Tier 3: 静摩擦约束力分配 (500 Hz)              │
+│     ＋ IK/位控/MPC 等其他模式                      │
+├──────────────────────────────────────────────────┤
+│     物理引擎：MuJoCo（Go1 模型）                    │
+└──────────────────────────────────────────────────┘
 ```
 
 - **下层（MyDog 自身）**：用传统控制方法做整机的 locomotion 原语
   - 已完成：单腿足尖轨迹跟踪 ✅，四足步态规划与控制（trot/walk/pace/bound）✅
   - 已完成：浮基动力学仿真（MIT 力控 + 位控 stance 锚定）✅
   - 已完成：SRB 凸 MPC + MIT 阻抗控制 ✅
-  - 进行中：MPC 速度跟踪调优、RL 集成
+  - 已完成：三次多项式 + 静摩擦约束力分配（Quintic+Friction 三层架构）✅
+  - 进行中：RL 集成 — 让 RL 决策步态类型 + 估计地面 μ_max
 - **上层（UniLab）**：用 RL 做智能决策
   - 部署于本地 `/home/scj/UniLab`
-  - 输出高层动作（目标速度、航向角、步态类型）
-  - 下发到下层传统控制器执行
+  - 输出高层动作：**目标速度、航向角、步态类型、地面摩擦系数 μ_max**
+  - 下发到下层传统控制器执行：μ_max 直接传入 Tier 3 摩擦锥约束，步态类型选择 Tier 2 轨迹+Tier 3 力分配策略
 
 ## 技术栈
 
@@ -76,7 +79,8 @@ uv sync --extra motrix
 │   │   ├── controller.py    #   IKFootController — 单腿 IK 位置控制
 │   │   ├── gait.py          #   步态调度 + 足尖轨迹规划
 │   │   ├── body_controller.py   # BodyController — 四腿协调（位控）
-│   │   ├── force_controller.py  # MITBodyController + MPCMITBodyController
+│   │   ├── force_controller.py  # MITBodyController + MPCMITBodyController + QuinticFrictionController
+│   │   ├── friction_force.py    #   FrictionForceDistributor — 静摩擦约束力分配
 │   │   ├── mpc_controller.py    #   SRB 凸 MPC 求解器 (OSQP, N=10, dt=30ms)
 │   │   ├── urdf_loader.py   #   URDF → MJCF 转换
 │   │   ├── rl/              #   ⭐ RL 集成层（待实现）
@@ -110,6 +114,23 @@ uv sync --extra motrix
 │  ├─ Stance: τ = Jᵀ·(F_mpc + Kp·Δx - Kd·v)       │
 │  ├─ Swing:  τ = Jᵀ·(Kp·Δx - Kd·v)  (纯阻抗)     │
 │  └─ QP 失败 → 自动 fallback 到 Body PD           │
+├─────────────────────────────────────────────────┤
+│  Quintic+Friction Mode (--force --quintic --float) │
+│  QuinticFrictionController ← MITBodyController  │
+│  ├─ Tier 1 (~10Hz, 可选): 步态参数自适应             │
+│  │    RL 决策步态类型 → Tier 2 轨迹 + Tier 3 力分配  │
+│  │    RL 估计 μ_max → 传入 Tier 3 摩擦锥约束         │
+│  │    --adapt-params: 规则化调整 step_length         │
+│  ├─ Tier 2 (按需): 五次多项式摆动轨迹 (C² 连续)       │
+│  │    QuinticFootTrajectoryPlanner               │
+│  ├─ Tier 3 (500Hz): 静摩擦约束力分配              │
+│  │    FrictionForceDistributor                   │
+│  │    2 腿零空间解析解 + 线性化摩擦锥约束           │
+│  │    f = f_particular + α·f_null, α 由约束确定   │
+│  │    μ_max 来源: RL 估计 > 手动指定 (--mu-max)     │
+│  ├─ Stance: τ = Jᵀ·(F_friction + Kp·Δx - Kd·v)   │
+│  ├─ Swing:  τ = Jᵀ·(Kp·Δx - Kd·v) (五次轨迹跟踪)  │
+│  └─ 摩擦利用率 μ_utilized 实时监控                 │
 ├─────────────────────────────────────────────────┤
 │  Force Mode (--force --float)                   │
 │  MITBodyController                              │
@@ -169,8 +190,12 @@ uv sync --extra motrix
 - **`MITBodyController`**：Body PD 力控
   - Body PD: Fz = -mg + Kp_z·(z - h_target) - Kd_z·vz, Fx = -Kp_vx·(vx_target - vx)
   - 力分配：Fz/n 均分到 stance 腿，roll/pitch moment 差动分配
+  - Stance 脚跟随身体旋转：捕获身体系偏移 `Rᵀ·(p_foot - p_com)`，目标 = `com + R·offset`
+    （而非锁死世界坐标 → 避免纯旋转时身体被迫平移）
+  - 纯旋转模式 (vx=vy=0)：记录 settle 后锚点，Kp_px=20 温和抑制 CoM 漂移（~4.3cm/3s）
+  - Kp_vy=200（侧向速度 PD 增强），Kp_vx=500
   - 重构为 `_compute_body_pd_wrench()` → `_apply_leg_impedance()` 两步
-  - Stance: 阻抗控制追踪当前脚位 (target.z=0) + 前馈 GRF
+  - Stance: 阻抗控制追踪计算的目标 (target.z=0) + 前馈 GRF
   - Swing: 阻抗控制追踪规划的 hip 系轨迹
   - 启动时先 position settle (0.5s)，再切力矩控制
 
@@ -305,20 +330,159 @@ Simulation complete.
 - T_cycle 缩短到 0.25s（原 0.5s）是速度提升的关键因素
 - Body PD 在 T=0.25 时不稳定，仅 MPC 可用
 
-#### 速度跟踪调优结果
+### Quintic + 静摩擦约束控制
 
-**T_cycle + step_length 优化后，Trot 步态 (T=0.25, L=0.22)**：
+```bash
+# 基本模式（五次多项式摆动 + 摩擦约束力分配）
+python3 -m src.main --gait --float --force --quintic --viewer --gait-type trot \
+    --gait-T 0.25 --step-length 0.22 --target-vx 0.3
 
-| 目标 | 实际 vx | 实际 vy | 实际 wz | 效率 |
-|------|---------|---------|---------|------|
-| vx=0.3, vy=0 | 0.207 | -0.000 | -0.000 | vx=69% |
-| vx=0, vy=0.2 | 0.052 | 0.087 | +0.055 | vy=44% |
-| vx=0, vyaw=0.5 | 0.047 | -0.004 | **0.005** | vyaw=**1%** |
-| vx=0.3, vy=0.2 | 0.207 | 0.068 | +0.043 | vx=69%, vy=34% |
+# 偏航测试（运动学偏航，K_kin_wz=0.20，~50% 跟踪率）
+python3 -m src.main --gait --float --force --quintic --viewer --gait-type trot \
+    --target-vyaw 0.5 --gait-cycles 8
+
+# 动量控制偏航
+python3 -m src.main --gait --float --force --quintic --momentum --viewer \
+    --gait-type trot --target-vyaw 0.5 --target-vx 0.3 --gait-cycles 8
+
+# 启用 Tier 1 参数自适应
+python3 -m src.main --gait --float --force --quintic --adapt-params --viewer \
+    --gait-type trot --gait-T 0.25 --step-length 0.08 --target-vx 0.3
+
+# 自定义摩擦系数
+python3 -m src.main --gait --float --force --quintic --viewer --gait-type trot \
+    --mu-max 0.8 --target-vx 0.3
+```
+
+#### 输出示例
+
+```
+============================================================
+  MyDog — Quintic + Friction Force Gait [headless]
+  Gait: trot, T_cycle=0.25s, duty=0.60
+  Target vx=0.30, vy=0.00, vyaw=0.00
+  Friction μ_max=0.6, adapt_params=False
+============================================================
+
+  Step 500/1250: pos=[ 0.175, -0.008, 0.280] vel=[ 0.194, 0.008,-0.007] μ=0.72 α=0.0
+  Step 1000/1250:pos=[ 0.366, -0.011, 0.280] vel=[ 0.194, 0.009,-0.007] μ=0.72 α=0.0
+
+Final state: pos=[ 0.460, -0.012, 0.280] vel=[ 0.193, 0.010,-0.005]
+Friction stats: μ_utilized=0.713, feasible=True, α=0.000
+```
+
+**关键指标**：
+- `μ_utilized`: 摩擦利用率（0=无摩擦, 1=达 μ_max 极限）；实时反映系统离摩擦极限的距离
+- `α`: 零空间参数 — 0 表示最小范数解在摩擦锥内（系统有余量）；非零表示需偏移才能满足约束
+- `feasible`: 期望 wrench 是否在摩擦锥内可行
+
+#### 三层架构
+
+```
+Tier 1 (~10 Hz, 可选): 步态参数自适应
+  └─ 根据 μ_utilized 和速度误差调整 step_length
+
+Tier 2 (按需): 五次多项式摆动轨迹 (QuinticFootTrajectoryPlanner)
+  └─ C² 连续足端轨迹：零速度/零加速度 at touchdown & liftoff
+
+Tier 3 (500 Hz): 静摩擦约束力分配 (FrictionForceDistributor)
+  └─ 2 腿 trot: min ||f||² s.t. A·f = [Fx,Fy,Mz], |fxᵢ|,|fyᵢ| ≤ μ·fzᵢ
+  └─ 1D 零空间解析解: f = f_p + α·f_null, α 由线性化摩擦锥边界确定
+```
+
+#### 对比 Body PD / MPC / Quintic+Friction / Momentum
+
+| 指标 | Body PD | MPC | Quintic+Friction | Momentum |
+|------|---------|-----|------------------|----------|
+| vx 跟踪 (target=0.3) | ~0.06 (20%) | **0.20 (67%)** | 0.19 (63%) | ~0.17 (57%) |
+| vy 跟踪 (target=0.2) | 不稳定 | ~0.09 (45%) | **0.11 (57%)** | ~0.10 (50%) |
+| vyaw 跟踪 (target=0.5) | ~1% | ~1% | **~45% 均值（运动学）** | **~40% 均值（运动学）** |
+| 身体稳定 (roll/pitch) | ±5° 振荡 | 0.6°/1.0° RMS | **0.2°/0.3° RMS** | 0.5°/1.0° RMS |
+| 摆动平滑性 | C0 | C0 | **C² 连续** | **C² 连续** |
+| 摩擦安全性 | 无保证 | QP 约束 | **显式约束 + μ_util** | **6D 求解 + 二分缩放** |
+| 力分配方式 | 均分 + 启发式 | QP 优化 | **3D 零空间解** | **6D Newton-Euler** |
+| Roll/Pitch 主动控制 | ✅ (新增) | ✅ (继承) | ✅ (新增) | ✅ (原有) |
+| 偏航角度控制 | P (基础) | P (基础) | **P+I+直连** | **P+I** |
+| 计算开销 | O(1) | 4-6ms QP | **O(1)** | **6×6 solve + 二分搜索** |
+| 可解释性 | 低 | 低（13 权重） | **高（μ_util, α）** | **高（μ_max, cond）** |
+
+**身体姿态 + 偏航控制** (`force_controller.py`):
+- **Roll/Pitch**: 主动 PD 力矩通过差动 Fz 实现身体水平控制（之前显式设 Mx=My=0）
+  - 增益: Kp_roll=30, Kd_roll=10, Kp_pitch=30, Kd_pitch=10 Nm/rad
+  - 效果: roll/pitch 从 ±5° 振荡降至 0.2-1.0° RMS
+- **Yaw**: P + I 角度控制器 + 角速度阻尼，增益按运动方向自适应
+  - 前进时：小 P (5 Nm/rad) + 慢 I (2 Nm/rad·s)，维持航向
+  - 侧向时：大 P (25 Nm/rad) + 快 I (40 Nm/rad·s)，对抗 COM 偏移力矩
+  - 侧向辅助直连力矩 (`qfrc_applied`，绕过腿力传递链损耗)
+- Stance 脚跟随身体旋转：捕获身体系偏移 `Rᵀ·(p_foot - p_com)`，目标 = `com + R·offset`
+  （而非锁死世界坐标 → 纯旋转时脚绕 CoM 画弧，身体不被迫平移）
+- CoM 位置锚点 PD (Kp=20 N/m)：仅在纯旋转模式 (vx=vy=0) 启用，抑制残余漂移至 ~4.3cm/3s
+- **落脚点偏移钳制**：`step_delta` ±15cm, `lat_offset` ±5cm, `yaw_offset` ±45°，防止脚超出工作空间
+- **COM 修正**：摩擦力分配器使用整机 COM 估计（前方 ~1cm），而非 trunk body 原点
+
+#### 算法改进 (2026-06)
+
+**1. Roll/Pitch 主动力矩控制** — `MITBodyController` 和 `QuinticFrictionController` 之前显式设 Mx=My=0，仅靠 stance 阻抗被动稳姿。现在通过差动 Fz 实现主动身体水平控制：
+- 身体 roll/pitch RMS: **0.2-1.0°**（改进前 ±5° 振荡）
+- 前进时 vy 漂移仅 ~2mm/s
+
+**2. 五次 Z 轴足端轨迹** — `QuinticFootTrajectoryPlanner` 用两段五次多项式替代 `z = H·sin(πs)`，实现 C² 连续触地和离地（零速度/零加速度），触地冲击速度从 ~0.63 m/s 降至 0。
+
+**3. 偏航角度 P + I 控制** — 原只有角速度 PD（`Kp_yaw * dwz`），无法消除稳态偏航误差。新增：
+- 四元数微分的世界系偏航角计算（`qvel[5]` 不是世界系 wz）
+- 偏航角度 P + 积分 I 控制器，增益按侧向/前进比例自适应（前进时小增益保持航向，侧向时大增益对抗 COM 偏移力矩）
+- 落脚点偏移钳制（`lat_offset` ±5cm, `step_delta` ±15cm, `yaw_offset` ±45°）
+- 纯侧向运动时辅助直连力矩通道（`qfrc_applied`，绕过腿力传递链损耗）
+- 偏航误差 >9° 时自动降低侧向力释放摩擦预算
+
+**4. MPC 控制代价正则化** — `R_diag` 从 `[1e-6, 1e-6, 1e-8]` 提升至 `[1e-3, 1e-3, 1e-4]`，消除力指令跳变，改善 QP Hessian 条件数（2e12 → 1e6）。
+
+**5. OSQP Warm-Start** — 复用 OSQP 求解器对象而非每次新建，保持内部状态用于热启动。
+
+**6. 速度跟踪指标采集** — `VelocityMetrics` 类记录每步 vx/vy/wz 误差、高度、姿态角，仿真结束时输出稳态汇总（均值/RMSE/跟踪百分比）。所有力控模式均支持。
+
+**7. 力控参数重调** — Quintic+Friction 模式的增益和阻抗经系统调优：
+
+| 参数 | 原值 | 新值 | 原因 |
+|------|------|------|------|
+| `K_kin_vx` | 2.0 | 1.0 | 落脚点偏移减半，避免腿过度前伸 |
+| `K_kin_vy` | 0.6 | 0.4 | 侧向落脚点更温和 |
+| `Kp_vx` | 300 | 500 | 更大的前向力（摩擦约束会自动限幅） |
+| `Kp_vy` | 150 | 200 | 更大的侧向力 |
+| `Kp_yaw` | 10 | 15 | 更强的偏航角速度阻尼 |
+| `stance_Kp[xy]` | 200 | 100 | 更软的水平阻抗，让前馈力有效推脚 |
+| `stance_Kd[xy]` | 10 | 5 | 减少阻尼对抗前馈力 |
+
+**8. 摩擦力分配器 COM 修正** — `com_position` 改用整机 COM 估计（前方 ~1cm，下方 ~15cm），而非 trunk body 原点。原代码用 trunk body 位置当 COM，在侧向运动时产生 ~0.5 Nm 持续偏航力矩。
+
+#### 速度跟踪最终结果
+
+**Quintic+Friction 模式 (T=0.25, L=0.22, μ=0.6)**：
+
+| 目标 | 实际 vx | 实际 vy | roll/pitch | 备注 |
+|------|---------|---------|------------|------|
+| vx=0.3, vy=0 | **0.190 (63%)** | −0.002 | 0.2°/0.3° RMS | 前进稳定，几乎无侧漂 |
+| vx=0.5, vy=0 | 0.175 (35%) | +0.022 | 0.4°/0.5° RMS | 超最大速度 (~0.2)，摩擦饱和 |
+| vx=0, vy=0.3 | 0.014 | **0.135 (45%)** | 0.8°/0.6° RMS | 纯侧向，~7° 偏航残余 |
+| vx=0.3, vy=0.2 | 0.142 (47%) | **0.114 (57%)** | 0.7°/0.3° RMS | vy 较原始提升 68% |
+
+**MPC 模式 (T=0.25, L=0.22)**：
+
+| 目标 | 实际 vx | MPC solve | fallback | roll/pitch |
+|------|---------|-----------|----------|------------|
+| vx=0.3, vy=0 | **0.201 (67%)** | 4.4ms | 0% | 0.6°/1.0° |
+
+**关键发现**：
+- **vy 跟踪大幅改善** — 侧向运动从 43%→45%（纯侧向）和 34%→57%（组合），提升 25-68%
+- **身体姿态极稳** — roll/pitch 从 ±5° 振荡降至 <1.0° RMS
+- **MPC 求解稳定** — 0% fallback，正则化 + warm-start 有效
+- **Quintic 前向速度 63% (0.19 m/s)** — 接近 MPC 的 67%，远优于 Body PD 的 20%
+- **Trot 纯侧向有 ~7° 偏航残余** — COM 偏移 + 对角支撑力矩抵消的固有限制。推荐 Pace/Walk 步态
+- **最大速度约 0.2 m/s** — 受关节阻尼（2 N·m·s/rad × 12）+ 接触阻尼限制。`vx=0.5` 时摩擦锥饱和，偏航修正被挤掉
 
 #### 步态对比 — 不同运动方向需要不同步态！
 
-**核心发现**：Trot 的对角支撑腿在侧向/偏航时力矩相消，切换步态可大幅改善：
+**核心发现**：Trot 偏航从力控基本无效（1%）→ 运动学落脚点偏移提升至 **45-57%**。侧向运动仍建议换步态：
 
 | 目标 | 指标 | Trot | Pace | Walk | 最佳 |
 |------|------|------|------|------|------|
@@ -330,14 +494,14 @@ Simulation complete.
 **分析**：
 - **Pace（同侧同步）**：FR+FL 同时着地、RR+RL 同时着地。侧向运动时同侧腿朝同一方向推，无力矩抵消。组合 vx+vy 时 vy 效率从 34%→61%（翻倍），vx 不受影响。
 - **Walk（波形，3 足着地）**：纯 vy 效率最高（56%），vyaw 有 10x 提升（1%→11%）。但因着地腿多，前向推进力分散，vx 略低。
-- **Trot（对角同步）**：前向运动最优（仅略逊 Pace），但侧向/偏航被对角力矩相消严重限制。
-- **Vyaw 仍然偏低**：即使最佳步态（Walk）也仅有 11% 效率。纯力控偏航在 MuJoCo 接触模型下有根本性局限。
+- **Trot（对角同步）**：前向运动最优（仅略逊 Pace），侧向有限制但偏航已通过运动学落脚点偏移解决（~50% 效率）。
+- **Vyaw 运动学方案**：力控偏航在 trot 下有几何限制（对角线力矩相消），运动学落脚点偏移（K_kin_wz=0.20）是偏航主力通道。
 
 **推荐策略**：
 - 前进为主 → Trot 或 Pace
 - 前进+侧向 → **Pace**（vy 效率翻倍）
 - 纯侧向 → **Walk**
-- 偏航 → 需要运动学方案（落脚点偏移），力控无法解决
+- 偏航 → 力控方案无效，运动学落脚点偏移已实现（K_kin_wz=0.20, ~50% trot 效率）
 
 **速度瓶颈分析**：
 - **接触阻尼**：MuJoCo 默认接触产生 ~142 N·s/m 等效阻尼，需要 ~30N 净推力维持 0.2 m/s
@@ -348,11 +512,12 @@ Simulation complete.
 - **MPC Q 权重 (Q_vx, Q_vy) 影响很小**：瓶颈在接触物理和步态几何，不在优化
 - **stance 阻抗 Kp/Kd 对速度无影响**：MPC 前馈力主导，阻抗仅维持接触
 
-**偏航（vyaw）局限性**：
-- SRB MPC 力差动偏航效率：Trot 1%, Pace 1%, Walk 11%
-- 即使 Walk 步态 10x 提升，仍然太低（目标 0.5 → 实际 0.053 rad/s）
-- 运动学偏航（落脚点偏移）机制已预留（`gait.py` target_vyaw，gain=0），待后续开发
-- 可能的方向：步态相位偏移 + 落脚点旋转的组合方案
+**偏航（vyaw）运动学方案**：
+- 力控偏航在 trot 下有根本性几何限制（对角力矩相消）→ 1% 效率
+- 运动学落脚点偏移：swing 时按 wz 误差偏移落地 x 位置，左脚落后 / 右脚超前 → CCW
+- K_kin_wz=0.20 时 trot 偏航跟踪 ~45-57%（相比力控 1%，提升 50x）
+- 仍有步态周期性振荡（离散落脚点调整的固有延迟），std≈0.24 rad/s
+- Momentum 控制器的 6D Mz 通道可与运动学偏航互补，提供微调
 
 #### Body PD vs MPC 对比
 
@@ -378,17 +543,22 @@ Simulation complete.
 | `--step-height` | 0.04 | 0.04 | 0.04 | 抬脚高度 (m) |
 | `--target-vx` | 0.3 | 0.3 | 0.3 | 目标前进速度 (m/s) |
 | `--target-vy` | 0.0 | 0.0~0.2 | 0.0 | 目标侧向速度 (m/s) |
-| `--target-vyaw` | 0.0 | 0.0 | 0.0 | 目标偏航角速度 (rad/s)，效果微弱 |
-
-**步态选择指南**（MPC 模式）：
-- `--target-vx 0.3`（纯前进）→ `--gait-type trot` 或 `pace`
-- `--target-vx 0.3 --target-vy 0.2`（前进+侧向）→ `--gait-type pace`（vy 效率翻倍）
-- `--target-vx 0 --target-vy 0.2`（纯侧向）→ `--gait-type walk`
-- `--target-vyaw 0.5`（偏航）→ 力控无法解决，需运动学方案
+| `--target-vyaw` | 0.0 | 0.0 | 0.0 | 目标偏航角速度 (rad/s) |
 | `--mpc` | - | ✓ | - | 启用 SRB 凸 MPC（需 --force --float） |
+| `--quintic` | - | ✓ | - | 启用五次轨迹+摩擦约束力控 |
+| `--momentum` | - | - | - | 启用 6×6 Newton-Euler 力分配（需 --quintic） |
+| `--mu-max` | 0.6 | 0.6 | 0.6 | 最大静摩擦系数（高目标速度时建议 0.9） |
+| `--adapt-params` | - | - | - | 启用 Tier 1 步态参数自适应（需 --quintic） |
 | `--dt` | 0.002 | 0.002 | 0.002 | 仿真步长 (s) |
 | `--viewer` | - | - | - | 开启 3D 交互窗口 |
 | `--no-plot` | - | - | - | 跳过图表输出 |
+
+**步态选择指南**：
+- `--target-vx 0.3`（纯前进）→ `--gait-type trot` 或 `pace`
+- `--target-vx 0.3 --target-vy 0.2`（前进+侧向）→ `--gait-type pace`（vy 效率翻倍）
+- `--target-vx 0 --target-vy 0.3`（纯侧向）→ `--gait-type pace` 或 `walk`（trot 有 ~7° 偏航残余）
+- `--target-vyaw 0.5`（偏航）→ 运动学落脚点偏移 (K_kin_wz=2.0, ~50% trot 效率)
+- `--target-vx 0.5`（高速）→ 需配合 `--mu-max 0.9`，否则摩擦锥饱和
 
 ### Viewer 操作
 

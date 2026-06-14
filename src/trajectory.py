@@ -147,3 +147,135 @@ class LissajousTrajectory(Trajectory):
 
     def duration(self) -> float:
         return self._T
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Quintic (5th-order) polynomial trajectory
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class QuinticTrajectory1D:
+    """5th-order (quintic) polynomial trajectory with C² continuity at boundaries.
+
+    x(t)  = a₀ + a₁t + a₂t² + a₃t³ + a₄t⁴ + a₅t⁵
+    v(t)  = a₁ + 2a₂t + 3a₃t² + 4a₄t³ + 5a₅t⁴
+    a(t)  = 2a₂ + 6a₃t + 12a₄t² + 20a₅t³
+
+    The 6 coefficients are solved from 6 boundary conditions:
+      x(0)=x0, v(0)=v0, a(0)=a0
+      x(T)=xT, v(T)=vT, a(T)=aT
+
+    This is a standalone scalar class — it does NOT inherit from Trajectory
+    (which returns ndarray). Use QuinticTrajectory3D for a 3D vector variant.
+    """
+
+    def __init__(self, T: float, x0: float, xT: float,
+                 v0: float = 0.0, a0: float = 0.0,
+                 vT: float = 0.0, aT: float = 0.0):
+        if T <= 0:
+            raise ValueError(f"Duration T must be positive, got {T}")
+        self._T = T
+        self._x0, self._v0, self._a0 = x0, v0, a0
+        self._xT, self._vT, self._aT = xT, vT, aT
+
+        # Solve coefficients: a0, a1, a2 from initial conditions directly
+        a0 = x0
+        a1 = v0
+        a2 = a0 / 2.0
+
+        # Remaining 3 coefficients [a3, a4, a5] from terminal conditions
+        # M @ [a3, a4, a5]^T = rhs
+        T2 = T * T
+        T3 = T2 * T
+        T4 = T3 * T
+        T5 = T4 * T
+
+        M = np.array([
+            [T3,       T4,       T5],
+            [3 * T2,   4 * T3,   5 * T4],
+            [6 * T,    12 * T2,  20 * T3],
+        ])
+        rhs = np.array([
+            xT - a0 - a1 * T - a2 * T2,
+            vT - a1 - 2 * a2 * T,
+            aT - 2 * a2,
+        ])
+
+        self._coeffs = np.zeros(6)
+        self._coeffs[0] = a0
+        self._coeffs[1] = a1
+        self._coeffs[2] = a2
+        self._coeffs[3:] = np.linalg.solve(M, rhs)
+
+    @property
+    def coefficients(self) -> np.ndarray:
+        """Return the 6 polynomial coefficients [a₀, …, a₅]."""
+        return self._coeffs.copy()
+
+    def evaluate(self, t: float) -> float:
+        """Evaluate position at normalised time t ∈ [0, T]."""
+        t = max(0.0, min(t, self._T))
+        return np.polyval(self._coeffs[::-1], t)
+
+    def evaluate_vel(self, t: float) -> float:
+        """Evaluate velocity at normalised time t ∈ [0, T]."""
+        t = max(0.0, min(t, self._T))
+        # derivative coefficients: [5a₅, 4a₄, 3a₃, 2a₂, a₁]
+        d_coeffs = np.array([
+            5 * self._coeffs[5],
+            4 * self._coeffs[4],
+            3 * self._coeffs[3],
+            2 * self._coeffs[2],
+            self._coeffs[1],
+        ])
+        return np.polyval(d_coeffs, t)
+
+    def evaluate_acc(self, t: float) -> float:
+        """Evaluate acceleration at normalised time t ∈ [0, T]."""
+        t = max(0.0, min(t, self._T))
+        # second derivative coefficients: [20a₅, 12a₄, 6a₃, 2a₂]
+        dd_coeffs = np.array([
+            20 * self._coeffs[5],
+            12 * self._coeffs[4],
+            6 * self._coeffs[3],
+            2 * self._coeffs[2],
+        ])
+        return np.polyval(dd_coeffs, t)
+
+    def duration(self) -> float:
+        return self._T
+
+
+class QuinticTrajectory3D(Trajectory):
+    """3D quintic trajectory composing three per-axis QuinticTrajectory1D instances.
+
+    Inherits from Trajectory so it can be used wherever the abstract base is expected.
+    """
+
+    def __init__(self, T: float,
+                 x0: np.ndarray, xT: np.ndarray,
+                 v0: np.ndarray = None, a0: np.ndarray = None,
+                 vT: np.ndarray = None, aT: np.ndarray = None):
+        self._T = T
+        x0 = np.asarray(x0, dtype=float)
+        xT = np.asarray(xT, dtype=float)
+        v0 = np.asarray(v0 if v0 is not None else [0, 0, 0], dtype=float)
+        a0 = np.asarray(a0 if a0 is not None else [0, 0, 0], dtype=float)
+        vT = np.asarray(vT if vT is not None else [0, 0, 0], dtype=float)
+        aT = np.asarray(aT if aT is not None else [0, 0, 0], dtype=float)
+
+        self._trajs = [
+            QuinticTrajectory1D(T, x0[i], xT[i], v0[i], a0[i], vT[i], aT[i])
+            for i in range(3)
+        ]
+
+    def evaluate(self, t: float) -> np.ndarray:
+        return np.array([traj.evaluate(t) for traj in self._trajs])
+
+    def evaluate_vel(self, t: float) -> np.ndarray:
+        return np.array([traj.evaluate_vel(t) for traj in self._trajs])
+
+    def evaluate_acc(self, t: float) -> np.ndarray:
+        return np.array([traj.evaluate_acc(t) for traj in self._trajs])
+
+    def duration(self) -> float:
+        return self._T

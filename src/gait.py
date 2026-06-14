@@ -158,6 +158,11 @@ class FootTrajectoryPlanner:
     X forward, Y left, Z up). For fixed-base simulation, the hip frame
     differs from the world frame only by a translation.
 
+    Kinematic velocity control (Raibert-style):
+      - step_length adjusted by forward velocity error
+      - lateral foot offset adjusted by lateral velocity error
+      - differential foot X offset for yaw rate control
+
     Usage:
         scheduler = GaitScheduler(GaitType.TROT, params)
         planner = FootTrajectoryPlanner(scheduler, neutral_foot)
@@ -183,6 +188,16 @@ class FootTrajectoryPlanner:
         self._warm_up = warm_up
         self.target_vyaw = 0.0  # kinematic yaw rate (rad/s), set by controller
 
+        # ── Kinematic velocity adjustment state ──
+        self._step_length_delta: float = 0.0   # forward velocity correction (m)
+        self._lateral_offset: float = 0.0      # lateral velocity correction (m)
+        self._yaw_offset: float = 0.0          # yaw rate correction (m, per-side)
+
+        # Gains (set by controller, exposed for tuning)
+        self.K_kin_vx: float = 0.0
+        self.K_kin_vy: float = 0.0
+        self.K_kin_wz: float = 0.0
+
     @property
     def scheduler(self) -> GaitScheduler:
         return self._scheduler
@@ -195,15 +210,53 @@ class FootTrajectoryPlanner:
         """Return the neutral foot position for a leg (hip frame)."""
         return self._neutral[leg].copy()
 
+    # ── Kinematic velocity adjustment interface ────────────────────────
+
+    def set_kinematic_adjustments(self, step_length_delta: float,
+                                  lateral_offset: float, yaw_angle: float):
+        """Set foot placement adjustments based on velocity errors.
+
+        Called by the controller each control step (~500 Hz).
+
+        Args:
+            step_length_delta: Additional step length for forward velocity
+                              correction (m).
+            lateral_offset: Lateral foot offset for sideways velocity
+                           correction (m).
+            yaw_angle: Rotation angle (rad) to apply to swing landing
+                      position. Positive = CCW body rotation.
+        """
+        self._step_length_delta = float(step_length_delta)
+        self._lateral_offset = float(lateral_offset)
+        self._yaw_offset = float(yaw_angle)
+
+    def _effective_neutral(self, leg: str) -> np.ndarray:
+        """Return the neutral foot position with kinematic adjustments applied.
+
+        Adjustments:
+          - lateral_offset: shifts Y in hip frame (all legs same direction)
+
+        Note: yaw_offset is NOT applied here. It is applied only to the swing
+        landing position in _build_swing_trajectories, because the stance
+        trajectory and swing start position should not be affected by the
+        rotational correction — only the foot's landing point matters.
+        """
+        n = self._neutral[leg].copy()
+        n[1] += self._lateral_offset
+        return n
+
+    def _effective_step_length(self, t: float) -> float:
+        """Return step_length with velocity correction + warm-up ramp."""
+        ramp = min(1.0, t / self._warm_up) if self._warm_up > 0 else 1.0
+        return (self.params.step_length + self._step_length_delta) * ramp
+
     def get_target_hip(self, leg: str, t: float) -> np.ndarray:
         """Compute desired foot position in hip frame at time t.
 
-        Kinematic yaw: a small lateral offset is added to the neutral foot
-        position, proportional to target_vyaw. This offset is constant
-        (does NOT grow with t) — the body's actual rotation accumulates
-        naturally via the hip rotation matrix in the controller. Each step,
-        the swing foot lands at a laterally-shifted position; during stance
-        the foot is anchored there, inducing body rotation.
+        Foot placement is adjusted by kinematic velocity feedback:
+          - step_length_delta corrects forward velocity
+          - lateral_offset corrects lateral velocity
+          - yaw_offset creates differential foot placement for turning
 
         Args:
             leg: Leg identifier ('FR', 'FL', 'RR', 'RL').
@@ -214,21 +267,11 @@ class FootTrajectoryPlanner:
         """
         state = self._scheduler.leg_state(leg, t)
         s = self._scheduler.phase_in_state(leg, t)  # progress ∈ [0, 1]
-        n = self._neutral[leg].copy()  # neutral foot position [nx, ny, nz]
+        n = self._effective_neutral(leg)
 
-        # ── Kinematic yaw: constant lateral offset (hip-frame Y shift) ──
-        # Positive vyaw (CCW / left turn): CoP shifts left.
-        # FR/RR: n[1] < 0 (foot right of hip); shift n[1] += offset → less right
-        # FL/RL: n[1] > 0 (foot left of hip);  shift n[1] += offset → more left
-        # Both get same-sign shift: CoP moves left → body turns CCW.
-        # NOTE: This is disabled by default (gain=0). MPC's force-based yaw
-        # is the primary mechanism. Increase gain (>0) to add kinematic turning.
-        if abs(self.target_vyaw) > 1e-6:
-            n[1] += self.target_vyaw * 0.0  # kinematic yaw gain (set >0 to enable)
-
-        # Ramp parameters from 0 to target during warm-up period
+        # Ramp parameters
         ramp = min(1.0, t / self._warm_up) if self._warm_up > 0 else 1.0
-        L = self.params.step_length * ramp
+        L = self._effective_step_length(t)
         H = self.params.step_height * ramp
 
         if state == "stance":
@@ -286,3 +329,171 @@ class FootTrajectoryPlanner:
             return 0.0
         else:
             return ramp * self.params.step_height * np.sin(np.pi * s)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Quintic foot trajectory planner (C²-continuous swing trajectories)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class QuinticFootTrajectoryPlanner(FootTrajectoryPlanner):
+    """Foot trajectory planner using quintic polynomials for C²-continuous swing.
+
+    Inherits stance trajectory (linear backward X) and sinusoidal Z lift from
+    FootTrajectoryPlanner.  Replaces the linear-X swing with a quintic polynomial
+    that guarantees zero velocity and acceleration at touchdown and liftoff,
+    producing smoother foot transitions.
+
+    On each stance→swing transition, three per-axis quintic trajectories are
+    built and cached for the duration of the swing phase.
+    """
+
+    def __init__(self, scheduler: GaitScheduler,
+                 neutral_foot: Dict[str, np.ndarray],
+                 warm_up: float = 0.2):
+        super().__init__(scheduler, neutral_foot, warm_up)
+        self._swing_duration = (1.0 - scheduler.duty_factor) * scheduler.T_cycle
+        self._swing_traj: Dict[str, Dict[str, object]] = {
+            leg: {"x": None, "y": None, "z_rise": None, "z_fall": None}
+            for leg in ALL_LEGS
+        }
+        self._swing_t0: Dict[str, float] = {leg: 0.0 for leg in ALL_LEGS}
+        self._prev_state: Dict[str, str] = {leg: "stance" for leg in ALL_LEGS}
+
+    def _build_swing_trajectories(self, leg: str, t: float,
+                                  L: float, n: np.ndarray):
+        """Build quintic trajectories for X, Y, Z axes on swing entry.
+
+        X: from end-of-stance position to neutral + L/2 (forward foothold).
+        Y: constant at neutral_y → rotated landing (yaw adjustment).
+        Z: two-segment quintic: rise (0→T/2) + fall (T/2→T) with C² continuity
+           at touchdown and liftoff (v=0, a=0 at both boundaries).
+        """
+        from .trajectory import QuinticTrajectory1D
+
+        T_sw = self._swing_duration
+        if T_sw <= 0:
+            T_sw = 0.1  # fallback
+
+        # Landing position in hip frame BEFORE rotation: [nx + L/2, ny]
+        x_land0 = n[0] + L / 2.0
+        y_land0 = n[1]
+
+        # Yaw: rotate landing position by θ around body z-axis.
+        theta = self._yaw_offset
+        if abs(theta) > 1e-9:
+            c, s = np.cos(theta), np.sin(theta)
+            x_end = x_land0 * c - y_land0 * s
+            y_end = x_land0 * s + y_land0 * c
+        else:
+            x_end, y_end = x_land0, y_land0
+
+        x_start = n[0] - L / 2.0
+        self._swing_traj[leg]["x"] = QuinticTrajectory1D(
+            T_sw, x_start, x_end, v0=0.0, a0=0.0, vT=0.0, aT=0.0,
+        )
+
+        self._swing_traj[leg]["y"] = QuinticTrajectory1D(
+            T_sw, y_land0, y_end, v0=0.0, a0=0.0, vT=0.0, aT=0.0,
+        )
+
+        # ── Z: two-segment quintic for smooth touchdown ──
+        # Segment 1 (rise): 0 → T_sw/2, z_neutral → z_neutral + H*ramp
+        # Segment 2 (fall): T_sw/2 → T_sw, z_neutral + H*ramp → z_neutral
+        # Both with v=0, a=0 at boundaries (C² touchdown and liftoff).
+        half_T = T_sw / 2.0
+        ramp = min(1.0, t / self._warm_up) if self._warm_up > 0 else 1.0
+        H_eff = self.params.step_height * ramp
+        z_peak = n[2] + H_eff
+
+        self._swing_traj[leg]["z_rise"] = QuinticTrajectory1D(
+            half_T, n[2], z_peak, v0=0.0, a0=0.0, vT=0.0, aT=0.0,
+        )
+        self._swing_traj[leg]["z_fall"] = QuinticTrajectory1D(
+            half_T, z_peak, n[2], v0=0.0, a0=0.0, vT=0.0, aT=0.0,
+        )
+
+        self._swing_t0[leg] = t
+
+    def get_target_world_z(self, leg: str, t: float) -> float:
+        """Override: quintic Z lift for C² touchdown.
+
+        For stance: 0.0 (on ground).
+        For swing: two-segment quintic lift above ground level.
+        """
+        state = self._scheduler.leg_state(leg, t)
+        ramp = min(1.0, t / self._warm_up) if self._warm_up > 0 else 1.0
+
+        if state == "stance":
+            return 0.0
+
+        # Swing: use cached quintic trajectory if available, else fall back
+        tau = t - self._swing_t0.get(leg, 0.0)
+        tau = max(0.0, min(tau, self._swing_duration))
+
+        z_rise = self._swing_traj[leg].get("z_rise")
+        if z_rise is not None:
+            half_T = self._swing_duration / 2.0
+            if tau < half_T:
+                z_hip = z_rise.evaluate(tau)
+            else:
+                z_hip = self._swing_traj[leg]["z_fall"].evaluate(tau - half_T)
+            # z_hip includes neutral Z; subtract to get lift height above ground
+            z_neutral = self._neutral[leg][2]
+            return ramp * (z_hip - z_neutral)
+        else:
+            # Fallback: sinusoidal (shouldn't happen after first swing buildup)
+            s = self._scheduler.phase_in_state(leg, t)
+            return ramp * self.params.step_height * np.sin(np.pi * s)
+
+    def get_target_hip(self, leg: str, t: float) -> np.ndarray:
+        """Compute desired foot position in hip frame at time t.
+
+        Uses quintic polynomial for swing-phase X and Y (C²-continuous),
+        sinusoidal Z lift, and linear stance trajectory.
+
+        Kinematic velocity adjustments (Raibert-style foot placement) are
+        inherited from FootTrajectoryPlanner and applied to both stance
+        and swing phases.
+        """
+        state = self._scheduler.leg_state(leg, t)
+        s = self._scheduler.phase_in_state(leg, t)
+        n = self._effective_neutral(leg)  # includes kinematic adjustments
+
+        # Ramp
+        ramp = min(1.0, t / self._warm_up) if self._warm_up > 0 else 1.0
+        L = self._effective_step_length(t)
+        H = self.params.step_height * ramp
+
+        prev = self._prev_state.get(leg, "stance")
+
+        if state == "stance":
+            # Clear cached swing trajectories
+            self._swing_traj[leg] = {"x": None, "y": None,
+                                      "z_rise": None, "z_fall": None}
+            self._prev_state[leg] = "stance"
+            # Same linear stance as parent (uses adjusted L and n)
+            x = n[0] + L / 2.0 - L * s
+            return np.array([x, n[1], n[2]])
+
+        else:  # swing
+            # Build trajectories on stance→swing transition (uses adjusted n, L)
+            if prev == "stance" or self._swing_traj[leg].get("x") is None:
+                self._build_swing_trajectories(leg, t, L, n)
+
+            self._prev_state[leg] = "swing"
+
+            # Evaluate cached quintic trajectories
+            tau = t - self._swing_t0[leg]
+            tau = max(0.0, min(tau, self._swing_duration))
+
+            x = self._swing_traj[leg]["x"].evaluate(tau)
+            y = self._swing_traj[leg]["y"].evaluate(tau)
+
+            # Z: two-segment quintic (rise + fall) for C² touchdown
+            half_T = self._swing_duration / 2.0
+            if tau < half_T:
+                z = self._swing_traj[leg]["z_rise"].evaluate(tau)
+            else:
+                z = self._swing_traj[leg]["z_fall"].evaluate(tau - half_T)
+
+            return np.array([x, y, z])

@@ -97,8 +97,8 @@ class SrbMpcSolver:
             200.0,   # vz    — damp vertical oscillation
         ])
 
-        # Control cost per leg (3D force) — near-zero to maximize acceleration
-        self.R_diag = np.array([1e-6, 1e-6, 1e-8])
+        # Control cost per leg (3D force) — mild regularization to smooth forces
+        self.R_diag = np.array([1e-3, 1e-3, 1e-4])
 
         # ── OSQP problem (created on first solve) ──
         self._prob: Optional[osqp.OSQP] = None
@@ -413,7 +413,7 @@ class SrbMpcSolver:
 
         # ── Setup or update OSQP ──
         n_constraints = len(l)
-        if self._prob is None or not self._contact_changed(contact):
+        if self._prob is None:
             # First solve: full setup
             self._prob = osqp.OSQP()
             self._prob.setup(P=P_sparse, q=g, A=self._C, l=l, u=u,
@@ -421,8 +421,10 @@ class SrbMpcSolver:
                             eps_abs=1e-4, eps_rel=1e-4,
                             max_iter=2000, polish=False)
         else:
-            # Contact changed → matrix structure may differ, re-setup
-            self._prob = osqp.OSQP()
+            # Reuse solver object: OSQP preserves internal state for warm-start.
+            # The constraint matrix (self._C) is constant; only l, u, and q change.
+            # P changes slightly due to foot movement, but setup() with
+            # warm_start=True initializes from the previous solution.
             self._prob.setup(P=P_sparse, q=g, A=self._C, l=l, u=u,
                             warm_start=True, verbose=False,
                             eps_abs=1e-4, eps_rel=1e-4,
