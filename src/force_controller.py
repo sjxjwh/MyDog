@@ -59,8 +59,12 @@ GO1_MASS = 12.86       # kg (trunk + 4 legs)
 GRAVITY = 9.81
 TOTAL_WEIGHT = GO1_MASS * GRAVITY  # ≈ 126 N
 
-# Trunk inertia (approximate, from MJCF diaginertia)
-TRUNK_I = np.array([0.07166, 0.06301, 0.01681])  # Ixx, Iyy, Izz
+# Full-system inertia from MuJoCo mass matrix M(q) at standing config.
+# Previously used trunk-only body_inertia values which underestimate
+# yaw inertia by 25x (0.017→0.423). Leg parallel-axis contributions
+# add ~0.36 kg·m² to Izz and ~0.34 kg·m² to Iyy.
+# Verified via golden experiment: experiments/golden_izz_test.py
+FULL_SYSTEM_I = np.array([0.13145, 0.39869, 0.42295])  # Ixx, Iyy, Izz
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -612,7 +616,7 @@ class MPCMITBodyController(MITBodyController):
 
         self._mpc = SrbMpcSolver(
             mass=GO1_MASS,
-            inertia_body=TRUNK_I,
+            inertia_body=FULL_SYSTEM_I,
             hip_offsets_com=hip_offsets,
             N=10, dt_mpc=0.03, mu=0.6,
             fz_min=30.0, fz_max=150.0,
@@ -654,6 +658,41 @@ class MPCMITBodyController(MITBodyController):
 
         # ── Apply impedance with MPC forces (or fallback) ──
         self._apply_leg_impedance(t, self._mpc_forces)
+
+        # ── Direct yaw torque: complement MPC's GRF-based yaw ──
+        if abs(self.target_vyaw) > 0.001:
+            _, _, vel, angvel, _, _, yaw = self._body_state()
+            if not hasattr(self, '_mpc_initial_yaw') or self._mpc_initial_yaw is None:
+                self._mpc_initial_yaw = float(yaw)
+                self._mpc_prev_yaw = float(yaw)
+                self._mpc_prev_t = t
+                self._mpc_yaw_err_int = 0.0
+            # Compute yaw angle error
+            desired_yaw = self._mpc_initial_yaw + self.target_vyaw * t
+            dyaw = t - self._mpc_prev_t
+            yaw_err = float(np.arctan2(np.sin(desired_yaw - yaw),
+                                       np.cos(desired_yaw - yaw)))
+            # World-frame wz from quaternion diff
+            if dyaw > 1e-9:
+                world_wz = float(np.arctan2(np.sin(yaw - self._mpc_prev_yaw),
+                                            np.cos(yaw - self._mpc_prev_yaw))) / dyaw
+            else:
+                world_wz = float(angvel[2])
+            self._mpc_prev_yaw = yaw
+            self._mpc_prev_t = t
+            # Anti-windup integral
+            self._mpc_yaw_err_int += yaw_err * 0.002
+            self._mpc_yaw_err_int = float(np.clip(self._mpc_yaw_err_int, -1.0, 1.0))
+            # PD + I
+            Mz_dir = (90.0 * (self.target_vyaw - world_wz)
+                      + 30.0 * yaw_err
+                      + 12.0 * self._mpc_yaw_err_int)
+            Mz_dir = float(np.clip(Mz_dir, -8.0, 8.0))
+            trunk_id = self._sim._body_ids.get("trunk")
+            if trunk_id is not None:
+                jnt_id = self._sim._model.body_jntadr[trunk_id]
+                dof_adr = self._sim._model.jnt_dofadr[jnt_id]
+                self._sim._data.qfrc_applied[dof_adr + 5] = Mz_dir
 
         # ── Record velocity tracking metrics ──
         if self._metrics_enabled:
@@ -793,7 +832,7 @@ class QuinticFrictionController(MITBodyController):
         # these gains provide the feed-forward force through the favourable geometry.
         self.Kp_vx = 500.0   # forward push
         self.Kp_vy = 200.0   # lateral push
-        self.Kp_yaw = 15.0   # yaw torque
+        self.Kp_yaw = 90.0   # yaw torque (6x: corrected Izz is 25x larger)
 
         # ── Stance impedance: soft enough to let ff_force push foot back ──
         self._stance_Kp = np.array([100.0, 100.0, 500.0])
@@ -812,6 +851,26 @@ class QuinticFrictionController(MITBodyController):
         self._K_yaw_angle_force = 30.0  # force yaw angle P-gain (Nm/rad)
         self._K_yaw_angle_int = 40.0    # force yaw angle I-gain (Nm/rad·s)
         self._yaw_error_integral: float = 0.0
+
+        # ── Predictive yaw for stance impedance targets ──
+        # When target_vyaw ≠ 0, stance impedance targets are rotated by the
+        # *desired* yaw accumulation since touchdown.  This eliminates the
+        # impedance-layer conflict where body-frame anchors resist yaw rotation.
+        self._stance_touchdown_yaw: Dict[str, float] = {leg: 0.0 for leg in ALL_LEGS}
+        self._stance_touchdown_t: Dict[str, float] = {leg: 0.0 for leg in ALL_LEGS}
+        self._yaw_prediction_enabled: bool = False  # Kp=10 already soft enough
+        self._yaw_prediction_scale: float = 0.3
+        self._force_smoothing_enabled: bool = False
+        self._mz_saturated: bool = False
+        self._use_direct_yaw: bool = True  # direct yaw: verified 90% wz
+
+        # ── Debug data collection (for yaw analysis reports) ──
+        self._debug_enabled: bool = True
+        self._debug_steps: List[Dict] = []
+        self._debug_wrench_steps: List[Dict] = []
+        self._debug_wrench_desired: Dict = {}
+        self._debug_wrench_per_leg: Dict = {}
+        self._debug_friction_status: Dict = {}
 
         # ── Tier-1 adaptation state ──
         self._adapt_params = adapt_params
@@ -839,6 +898,128 @@ class QuinticFrictionController(MITBodyController):
     def friction_feasible(self) -> bool:
         """Whether the last force distribution was fully feasible."""
         return self._friction.feasible
+
+    # ── Override: Predictive yaw impedance targets ──────────────────────────
+
+    def _apply_leg_impedance(self, t: float,
+                             foot_forces: Dict[str, np.ndarray]):
+        """Per-leg impedance with predictive yaw rotation on stance targets.
+
+        Overrides MITBodyController._apply_leg_impedance.  The key change:
+        stance targets are rotated by the *desired* yaw accumulation since
+        touchdown, eliminating the impedance-layer conflict where body-frame
+        anchors resist yaw rotation.  Optional force smoothing ramps
+        feed-forward forces over the first 20% of stance.
+        """
+        pos, quat, vel, angvel, roll, pitch, yaw = self._body_state()
+        R_body = self._quat_to_rotmat(quat)
+
+        for leg in ALL_LEGS:
+            ctrl = self._ctrls[leg]
+            ctrl.clear()
+            state = self._scheduler.leg_state(leg, t)
+            prev = self._last_gait_state.get(leg, "stance")
+
+            if state == "stance" and leg in foot_forces:
+                # ── Capture body-frame offset on swing→stance transition ──
+                if prev == "swing" or np.allclose(self._stance_offset_body[leg], 0):
+                    foot_world = ctrl.get_foot_pos()
+                    self._stance_offset_body[leg] = R_body.T @ (foot_world - pos)
+                    # Record desired yaw angle and timestamp at touchdown
+                    if self._initial_yaw is not None:
+                        self._stance_touchdown_yaw[leg] = (
+                            self._initial_yaw + self.target_vyaw * t
+                        )
+                    self._stance_touchdown_t[leg] = t
+
+                # ── Compute predictive yaw rotation ──
+                R_offset = np.eye(3)
+                dyaw_pred = 0.0
+                if (self._yaw_prediction_enabled
+                        and abs(self.target_vyaw) > 0.001
+                        and self._initial_yaw is not None):
+                    desired_yaw_now = self._initial_yaw + self.target_vyaw * t
+                    dyaw_pred = (desired_yaw_now - self._stance_touchdown_yaw[leg]
+                                 ) * self._yaw_prediction_scale
+                    # Clamp to prevent foot targets from leaving workspace
+                    dyaw_pred = float(np.clip(dyaw_pred, -0.3, 0.3))
+                    if abs(dyaw_pred) > 1e-10:
+                        c, s = np.cos(dyaw_pred), np.sin(dyaw_pred)
+                        R_offset = np.array([
+                            [c, -s, 0.0],
+                            [s,  c, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ])
+
+                # ── Target = CoM + R_body @ R_yaw_pred @ offset_body ──
+                target = pos + R_body @ R_offset @ self._stance_offset_body[leg]
+                target[2] = 0.0
+
+                # ── Optional force smoothing (ramp ff over first 20% of stance) ──
+                ff = foot_forces[leg].copy()
+                if self._force_smoothing_enabled:
+                    dt_stance = t - self._stance_touchdown_t[leg]
+                    stance_dur = (self._scheduler.duty_factor
+                                  * self._scheduler.T_cycle)
+                    ramp_dur = 0.2 * stance_dur
+                    ramp = min(1.0, dt_stance / max(ramp_dur, 0.001))
+                    ff *= ramp
+
+                # ── Collect debug data ──
+                if self._debug_enabled:
+                    foot_world = ctrl.get_foot_pos()
+                    foot_vel = ctrl.get_foot_vel()
+                    target_err = target - foot_world
+                    self._debug_steps.append({
+                        't': t, 'leg': leg, 'state': 'stance',
+                        'yaw_actual': float(yaw),
+                        'yaw_desired': float(
+                            self._initial_yaw + self.target_vyaw * t
+                        ) if self._initial_yaw is not None else float(yaw),
+                        'dyaw_pred': float(dyaw_pred),
+                        'target_x': float(target[0]),
+                        'target_y': float(target[1]),
+                        'target_z': float(target[2]),
+                        'foot_x': float(foot_world[0]),
+                        'foot_y': float(foot_world[1]),
+                        'foot_z': float(foot_world[2]),
+                        'foot_vx': float(foot_vel[0]),
+                        'foot_vy': float(foot_vel[1]),
+                        'target_err_norm': float(np.linalg.norm(target_err)),
+                        'ff_fx': float(ff[0]),
+                        'ff_fy': float(ff[1]),
+                        'ff_fz': float(ff[2]),
+                    })
+
+                ctrl.apply_impedance(target, self._stance_Kp, self._stance_Kd,
+                                     ff_force=ff)
+            else:
+                # ── Swing: identical to base class ──
+                target_hip_xy = self._planner.get_target_hip_xy(leg, t)
+                target_world_z = self._planner.get_target_world_z(leg, t)
+                h_pos = ctrl.get_hip_pos()
+                h_rot = ctrl.get_hip_rot()
+                xy_world = h_pos[:2] + (h_rot[:2, :2] @ target_hip_xy)
+                target = np.array([xy_world[0], xy_world[1], target_world_z])
+
+                # ── Collect debug data for swing ──
+                if self._debug_enabled:
+                    foot_world = ctrl.get_foot_pos()
+                    self._debug_steps.append({
+                        't': t, 'leg': leg, 'state': 'swing',
+                        'target_x': float(target[0]),
+                        'target_y': float(target[1]),
+                        'target_z': float(target[2]),
+                        'foot_x': float(foot_world[0]),
+                        'foot_y': float(foot_world[1]),
+                        'foot_z': float(foot_world[2]),
+                        'ff_fx': 0.0, 'ff_fy': 0.0, 'ff_fz': 0.0,
+                        'yaw_actual': float(yaw),
+                    })
+
+                ctrl.apply_impedance(target, self._swing_Kp, self._swing_Kd)
+
+            self._last_gait_state[leg] = state
 
     @staticmethod
     def _wrap_pi(angle: float) -> float:
@@ -873,12 +1054,23 @@ class QuinticFrictionController(MITBodyController):
         yaw_err_angle = getattr(self, '_yaw_angle_error', 0.0)
         yaw_err_int = getattr(self, '_yaw_error_integral', 0.0)
         lat_ratio = abs(self.target_vy) / max(abs(self.target_vx) + abs(self.target_vy), 0.01)
-        # Base yaw P (always active) + lateral boost
-        yaw_P_eff = 5.0 + 20.0 * lat_ratio   # 5→25 Nm/rad
-        yaw_I_eff = 2.0 + 38.0 * lat_ratio   # 2→40 Nm/rad·s
-        Mz = (self.Kp_yaw * (self.target_vyaw - angvel[2])
-              + yaw_P_eff * yaw_err_angle
-              + yaw_I_eff * yaw_err_int)
+        # Base yaw P (always active) + lateral boost.
+        # Gains scaled 6x to compensate corrected Izz (0.423 vs old 0.017 ≈ 25x).
+        yaw_P_eff = 30.0 + 40.0 * lat_ratio   # 30→70 Nm/rad
+        yaw_I_eff = 12.0 + 48.0 * lat_ratio   # 12→60 Nm/rad·s
+        Mz_raw = (self.Kp_yaw * (self.target_vyaw - angvel[2])
+                  + yaw_P_eff * yaw_err_angle
+                  + yaw_I_eff * yaw_err_int)
+        # When using direct yaw torque, set Mz=0 in wrench — yaw is handled
+        # via qfrc_applied on the freejoint, bypassing the impedance layer.
+        if getattr(self, '_use_direct_yaw', False):
+            Mz = 0.0
+        else:
+            # Clamp to physically achievable Mz given friction constraints.
+            Mz = float(np.clip(Mz_raw, -8.0, 8.0))
+        self._mz_saturated = abs(Mz_raw - Mz) > 0.01
+        # Store raw Mz for direct yaw channel in control()
+        self._Mz_raw = float(Mz_raw)
 
         # ── CoM position anchor (resist drift during pure rotation) ──
         if abs(self.target_vx) < 0.01 and abs(self.target_vy) < 0.01:
@@ -954,6 +1146,47 @@ class QuinticFrictionController(MITBodyController):
         for leg in foot_forces:
             foot_forces[leg][2] = np.clip(foot_forces[leg][2], -200.0, 0.0)
 
+        # ── Store debug data for report generation ──
+        if self._debug_enabled:
+            # Desired wrench (Mz=0 when _use_direct_yaw; Mz_raw is the PD output)
+            self._debug_wrench_desired = {
+                'Fx': float(Fx), 'Fy': float(Fy), 'Mz': float(Mz),
+                'Mz_raw': float(Mz_raw),  # PD output before clamping/bypass
+                'Mz_rate_pd': float(self.Kp_yaw * (self.target_vyaw - angvel[2])),
+                'Mz_angle_p': float(yaw_P_eff * yaw_err_angle),
+                'Mz_angle_i': float(yaw_I_eff * yaw_err_int),
+            }
+            # Per-leg forces and Mz contribution
+            leg_mz = {}
+            leg_fz_ratio = {}
+            leg_friction_margin = {}
+            sum_fz = sum(abs(float(foot_forces[l][2])) for l in stance) + 0.001
+            for leg_name in stance:
+                f = foot_forces[leg_name]
+                r = np.asarray(foot_positions[leg_name]) - com_actual
+                # Per-leg Mz on BODY: -(r × f) in z.
+                # f is foot→ground; ground→body reaction = -f.
+                # Body torque = r × (-f) = -(r × f).
+                mz_i = float(-(r[0] * f[1] - r[1] * f[0]))
+                leg_mz[leg_name] = mz_i
+                leg_fz_ratio[leg_name] = float(abs(f[2]) / sum_fz)
+                # Friction margin: μ*fz - sqrt(fx²+fy²), negative = infeasible
+                fh_norm = float(np.sqrt(f[0]**2 + f[1]**2))
+                max_fh = self._friction.mu_max * max(abs(float(f[2])), 1.0)
+                leg_friction_margin[leg_name] = float(max_fh - fh_norm)
+            self._debug_wrench_per_leg = {
+                'forces': {l: foot_forces[l].tolist() for l in stance},
+                'mz_contrib': leg_mz,
+                'mz_net_actual': float(sum(leg_mz.values())),
+                'fz_ratio': leg_fz_ratio,
+                'friction_margin': leg_friction_margin,
+            }
+            self._debug_friction_status = {
+                'feasible': self._friction.feasible,
+                'mu_utilized': float(self._friction.mu_utilized),
+                'nullspace_alpha': float(self._friction.last_alpha),
+            }
+
         return foot_forces
 
     # ── Main control loop ─────────────────────────────────────────────────
@@ -987,9 +1220,13 @@ class QuinticFrictionController(MITBodyController):
         # Integrate yaw error — base rate always, faster for lateral motion
         lat_ratio = abs(self.target_vy) / max(abs(self.target_vx) + abs(self.target_vy), 0.01)
         int_rate = 0.2 + 0.8 * lat_ratio  # 0.2→1.0 scaling
-        self._yaw_error_integral += yaw_angle_error * 0.002 * int_rate
+        # Anti-windup: pause integration if Mz saturated last step, unless
+        # error and integral have opposite signs (unwinding).
+        mz_sat = getattr(self, '_mz_saturated', False)
+        if not mz_sat or yaw_angle_error * self._yaw_error_integral <= 0:
+            self._yaw_error_integral += yaw_angle_error * 0.002 * int_rate
         self._yaw_error_integral = float(np.clip(
-            self._yaw_error_integral, -2.0, 2.0))  # anti-windup
+            self._yaw_error_integral, -2.0, 2.0))  # hard clamp
 
         dvx = self.target_vx - vel[0]
         dvy = self.target_vy - vel[1]
@@ -1000,8 +1237,8 @@ class QuinticFrictionController(MITBodyController):
         lat_offset = np.clip(self._planner.K_kin_vy * dvy, -0.05, 0.05)
         # Yaw: rate + angle P + integral (base always active, scaled up for lateral)
         lat_ratio = abs(self.target_vy) / max(abs(self.target_vx) + abs(self.target_vy), 0.01)
-        k_angle = 0.5 + 3.5 * lat_ratio   # 0.5→4.0 rad/rad
-        k_int = 1.0 + 4.0 * lat_ratio     # 1.0→5.0 rad/rad·s
+        k_angle = 1.5 + 5.0 * lat_ratio   # 1.5→6.5 rad/rad (3x base)
+        k_int = 3.0 + 6.0 * lat_ratio     # 3.0→9.0 rad/rad·s (3x base)
         yaw_offset = np.clip(
             self._planner.K_kin_wz * dwz
             + k_angle * yaw_angle_error
@@ -1021,18 +1258,58 @@ class QuinticFrictionController(MITBodyController):
         # ── Step 4: Impedance control with quintic trajectories ──
         self._apply_leg_impedance(t, foot_forces)
 
-        # Direct yaw torque: only for lateral-dominant motion where leg chain
-        # has poor yaw authority. Skip for forward walking.
-        if abs(self.target_vy) > 0.05 and abs(self.target_vx) < 0.05:
-            yaw_err2 = getattr(self, '_yaw_angle_error', 0.0)
-            yaw_int2 = getattr(self, '_yaw_error_integral', 0.0)
-            Mz_direct = 2.0 * yaw_err2 + 3.0 * yaw_int2
+        # Direct yaw torque: apply Mz_raw to freejoint, bypassing the impedance
+        # layer entirely.  This eliminates the impedance→forward-thrust
+        # interference that plagues force-based yaw in trot.
+        if getattr(self, '_use_direct_yaw', False) and abs(self.target_vyaw) > 0.001:
+            Mz_direct = getattr(self, '_Mz_raw', 0.0)
+            # Clamp to safe range (freejoint torque is in Nm)
+            Mz_direct = float(np.clip(Mz_direct, -8.0, 8.0))
             trunk_id = self._sim._body_ids.get("trunk")
             if trunk_id is not None:
                 jnt_id = self._sim._model.body_jntadr[trunk_id]
                 dof_adr = self._sim._model.jnt_dofadr[jnt_id]
-                self._sim._data.qfrc_applied[dof_adr + 5] = float(np.clip(
-                    Mz_direct, -5.0, 5.0))
+                self._sim._data.qfrc_applied[dof_adr + 5] = Mz_direct
+
+        # ── Collect per-step debug data for yaw analysis report ──
+        if self._debug_enabled:
+            pos, quat, vel, angvel, roll, pitch, yaw = self._body_state()
+            desired_yaw_now = (self._initial_yaw + self.target_vyaw * t
+                               if self._initial_yaw is not None else yaw)
+            yaw_err = self._wrap_pi(desired_yaw_now - yaw)
+            # Get desired wrench from last friction computation
+            wd = self._debug_wrench_desired
+            wl = self._debug_wrench_per_leg
+            fs = self._debug_friction_status
+            self._debug_wrench_steps.append({
+                't': float(t),
+                # Body state
+                'yaw': float(yaw),
+                'yaw_desired': float(desired_yaw_now),
+                'yaw_error': float(yaw_err),
+                'roll': float(roll), 'pitch': float(pitch),
+                'wz_world': float(self._world_wz),
+                'wz_qvel': float(angvel[2]),
+                'vx': float(vel[0]), 'vy': float(vel[1]),
+                'height': float(pos[2]),
+                # Desired wrench (before distribution)
+                'Fx_des': wd.get('Fx', 0.0),
+                'Fy_des': wd.get('Fy', 0.0),
+                'Mz_des': wd.get('Mz', 0.0),
+                'Mz_raw': wd.get('Mz_raw', 0.0),  # PD output (≠Mz_des when direct yaw)
+                'Mz_rate_pd': wd.get('Mz_rate_pd', 0.0),
+                'Mz_angle_p': wd.get('Mz_angle_p', 0.0),
+                'Mz_angle_i': wd.get('Mz_angle_i', 0.0),
+                # Achieved per-leg Mz and force distribution
+                'mz_legs': dict(wl.get('mz_contrib', {})),
+                'mz_net_actual': wl.get('mz_net_actual', 0.0),
+                'fz_ratio': dict(wl.get('fz_ratio', {})),
+                'friction_margin': dict(wl.get('friction_margin', {})),
+                # Friction solver status
+                'feasible': fs.get('feasible', True),
+                'mu_utilized': fs.get('mu_utilized', 0.0),
+                'nullspace_alpha': fs.get('nullspace_alpha', 0.0),
+            })
 
         # Record stats for Tier-1 adaptation
         self.record_stats()
@@ -1120,6 +1397,437 @@ class QuinticFrictionController(MITBodyController):
             "T_cycle": self._scheduler.T_cycle,
             "step_length": self._scheduler.params.step_length,
         }
+
+    # ── Debug Report Generation ────────────────────────────────────────────
+
+    def generate_debug_report(self, output_path: str = None) -> str:
+        """Generate a comprehensive yaw-analysis debug report in Markdown.
+
+        Covers 10 diagnostic sections as specified in guide.md.  Saves to
+        ``output_path`` if provided, otherwise returns the report as a string.
+        """
+        import os as _os
+        from datetime import datetime as _datetime
+
+        if not self._debug_enabled or len(self._debug_wrench_steps) < 50:
+            return "Debug disabled or insufficient data (< 50 steps)."
+
+        ws = self._debug_wrench_steps
+        ds = self._debug_steps
+        n_total = len(ws)
+
+        # Use last 30% for steady-state analysis
+        n_ss = max(int(n_total * 0.3), 50)
+        ws_ss = ws[-n_ss:]
+
+        # ── Helper: stats dict from array ──
+        def _stats(arr):
+            a = np.array(arr)
+            return {'mean': float(np.mean(a)), 'rmse': float(np.sqrt(np.mean(a**2))),
+                    'max': float(np.max(np.abs(a))), 'std': float(np.std(a))}
+
+        lines = []
+        def _h(s): lines.append(f"\n## {s}\n")
+        def _tbl(header, rows):
+            lines.append("| " + " | ".join(header) + " |")
+            lines.append("|" + "|".join(["---"] * len(header)) + "|")
+            for r in rows:
+                lines.append("| " + " | ".join(str(c) for c in r) + " |")
+
+        tstamp = _datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines.append(f"# Trot Yaw Debug Report\n\n**Generated**: {tstamp}\n")
+        lines.append(f"**Samples**: {n_total} total, {n_ss} steady-state")
+        lines.append(f"**Gait**: {self._scheduler._gait_type.name if hasattr(self._scheduler, '_gait_type') else 'trot'}, "
+                     f"T={self._scheduler.T_cycle:.3f}s, duty={self._scheduler.duty_factor:.2f}")
+        lines.append(f"**Targets**: vx={self.target_vx:.2f}, vy={self.target_vy:.2f}, "
+                     f"vyaw={self.target_vyaw:.2f}")
+        lines.append(f"**Yaw prediction**: {'ON' if self._yaw_prediction_enabled else 'OFF'}, "
+                     f"**Force smoothing**: {'ON' if self._force_smoothing_enabled else 'OFF'}")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Section 1: Velocity Tracking Summary
+        # ═══════════════════════════════════════════════════════════════════
+        _h("1. Velocity Tracking Summary")
+        vx_a = np.array([d['vx'] for d in ws_ss])
+        vy_a = np.array([d['vy'] for d in ws_ss])
+        wz_a = np.array([d['wz_world'] for d in ws_ss])
+        _tbl(["Item", "Cmd", "Avg", "RMSE", "Max Err"],
+             [["vx", f"{self.target_vx:.2f}", f"{np.mean(vx_a):.3f}",
+               f"{np.sqrt(np.mean((self.target_vx - vx_a)**2)):.3f}",
+               f"{np.max(np.abs(self.target_vx - vx_a)):.3f}"],
+              ["vy", f"{self.target_vy:.2f}", f"{np.mean(vy_a):.3f}",
+               f"{np.sqrt(np.mean((self.target_vy - vy_a)**2)):.3f}",
+               f"{np.max(np.abs(self.target_vy - vy_a)):.3f}"],
+              ["wz", f"{self.target_vyaw:.2f}", f"{np.mean(wz_a):.3f}",
+               f"{np.sqrt(np.mean((self.target_vyaw - wz_a)**2)):.3f}",
+               f"{np.max(np.abs(self.target_vyaw - wz_a)):.3f}"]])
+
+        # Tracking percentages
+        vx_pct = max(0, 100*(1 - abs(self.target_vx - np.mean(vx_a)) / max(abs(self.target_vx), 0.01)))
+        vy_pct = max(0, 100*(1 - abs(self.target_vy - np.mean(vy_a)) / max(abs(self.target_vy), 0.01)))
+        wz_pct = max(0, 100*(1 - abs(self.target_vyaw - np.mean(wz_a)) / max(abs(self.target_vyaw), 0.01)))
+        lines.append(f"\n**Track %**: vx={vx_pct:.1f}%, vy={vy_pct:.1f}%, wz={wz_pct:.1f}%")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Section 2: Attitude Stability
+        # ═══════════════════════════════════════════════════════════════════
+        _h("2. Attitude Stability")
+        roll_a = np.array([d['roll'] for d in ws_ss])
+        pitch_a = np.array([d['pitch'] for d in ws_ss])
+        yaw_err_a = np.array([d['yaw_error'] for d in ws_ss])
+        h_a = np.array([d['height'] for d in ws_ss])
+        # Yaw drift rate: linear fit to yaw vs time
+        t_a = np.array([d['t'] for d in ws_ss])
+        yaw_actual_a = np.array([d['yaw'] for d in ws_ss])
+        if len(t_a) > 2:
+            yaw_drift = float(np.polyfit(t_a - t_a[0], yaw_actual_a, 1)[0])
+        else:
+            yaw_drift = 0.0
+
+        _tbl(["Metric", "RMS", "Mean", "Max |err|"],
+             [["Roll (deg)", f"{np.sqrt(np.mean(roll_a**2))*180/np.pi:.2f}",
+               f"{np.mean(roll_a)*180/np.pi:.2f}",
+               f"{np.max(np.abs(roll_a))*180/np.pi:.2f}"],
+              ["Pitch (deg)", f"{np.sqrt(np.mean(pitch_a**2))*180/np.pi:.2f}",
+               f"{np.mean(pitch_a)*180/np.pi:.2f}",
+               f"{np.max(np.abs(pitch_a))*180/np.pi:.2f}"],
+              ["Yaw err (deg)", f"{np.sqrt(np.mean(yaw_err_a**2))*180/np.pi:.2f}",
+               f"{np.mean(yaw_err_a)*180/np.pi:.2f}",
+               f"{np.max(np.abs(yaw_err_a))*180/np.pi:.2f}"],
+              ["Height (m)", f"{np.std(h_a):.3f}",
+               f"{np.mean(h_a):.3f}",
+               f"{np.max(np.abs(h_a - 0.28)):.3f}"]])
+        lines.append(f"\n**Yaw drift rate**: {yaw_drift*180/np.pi:.2f} deg/s "
+                     f"({'≈ target' if abs(yaw_drift - self.target_vyaw) < 0.1 else 'DRIFTING' if abs(yaw_drift) > 0.05 else 'ok'})")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Section 3: Force Distribution Statistics
+        # ═══════════════════════════════════════════════════════════════════
+        _h("3. Force Distribution Statistics")
+
+        # Aggregate per-leg data from _debug_steps (stance only)
+        stance_ds = [d for d in ds if d.get('state') == 'stance'
+                     and d['t'] >= ws_ss[0]['t']]
+        leg_names = ALL_LEGS
+        leg_ff = {l: {'fx': [], 'fy': [], 'fz': []} for l in leg_names}
+        leg_slip_v = {l: [] for l in leg_names}
+        leg_slip_d = {l: 0.0 for l in leg_names}
+        leg_count = {l: 0 for l in leg_names}
+        prev_t = {}
+        for d in stance_ds:
+            l = d['leg']
+            leg_ff[l]['fx'].append(d['ff_fx'])
+            leg_ff[l]['fy'].append(d['ff_fy'])
+            leg_ff[l]['fz'].append(d['ff_fz'])
+            leg_slip_v[l].append(np.sqrt(d.get('foot_vx',0)**2 + d.get('foot_vy',0)**2))
+            leg_count[l] += 1
+            if l in prev_t:
+                dt_slip = d['t'] - prev_t[l]
+                leg_slip_d[l] += np.sqrt(d.get('foot_vx',0)**2 + d.get('foot_vy',0)**2) * dt_slip
+            prev_t[l] = d['t']
+
+        # Support ratio from wrench steps
+        fz_ratios = {l: [] for l in leg_names}
+        for w in ws_ss:
+            fr = w.get('fz_ratio', {})
+            for l in leg_names:
+                if l in fr:
+                    fz_ratios[l].append(fr[l])
+
+        rows = []
+        for l in leg_names:
+            n = max(leg_count[l], 1)
+            rows.append([
+                l,
+                f"{np.mean(leg_ff[l]['fx']):+.2f}" if leg_ff[l]['fx'] else "N/A",
+                f"{np.mean(leg_ff[l]['fy']):+.2f}" if leg_ff[l]['fy'] else "N/A",
+                f"{np.mean(leg_ff[l]['fz']):.1f}" if leg_ff[l]['fz'] else "N/A",
+                f"{np.mean(fz_ratios[l]):.2f}" if fz_ratios[l] else "N/A",
+                f"{leg_slip_d[l]:.3f}",
+            ])
+        _tbl(["Leg", "Avg Fx (N)", "Avg Fy (N)", "Avg Fz (N)", "Support Ratio",
+              "Slip Dist (m)"], rows)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Section 4: Impedance Target vs Actual Position
+        # ═══════════════════════════════════════════════════════════════════
+        _h("4. Impedance Target vs Actual Position")
+        stance_err = []
+        swing_err = []
+        stance_target_ds = [d for d in ds if d.get('state') == 'stance'
+                            and d['t'] >= ws_ss[0]['t']]
+        swing_target_ds = [d for d in ds if d.get('state') == 'swing'
+                           and d['t'] >= ws_ss[0]['t']]
+        for d in stance_target_ds:
+            if 'target_err_norm' in d:
+                stance_err.append(d['target_err_norm'])
+        for d in swing_target_ds:
+            dx = d.get('target_x', 0) - d.get('foot_x', 0)
+            dy = d.get('target_y', 0) - d.get('foot_y', 0)
+            dz = d.get('target_z', 0) - d.get('foot_z', 0)
+            swing_err.append(np.sqrt(dx**2 + dy**2 + dz**2))
+
+        _tbl(["Phase", "RMS Error (m)", "Max Error (m)", "Samples"],
+             [["Stance",
+               f"{np.sqrt(np.mean(np.array(stance_err)**2)):.4f}" if stance_err else "N/A",
+               f"{np.max(np.abs(stance_err)):.4f}" if stance_err else "N/A",
+               f"{len(stance_err)}"],
+              ["Swing",
+               f"{np.sqrt(np.mean(np.array(swing_err)**2)):.4f}" if swing_err else "N/A",
+               f"{np.max(np.abs(swing_err)):.4f}" if swing_err else "N/A",
+               f"{len(swing_err)}"]])
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Section 5: Yaw Moment Decomposition (THE KEY SECTION)
+        # ═══════════════════════════════════════════════════════════════════
+        _h("5. Yaw Moment Decomposition")
+
+        # Per-leg Mz contribution
+        leg_mz = {l: [] for l in leg_names}
+        for w in ws_ss:
+            ml = w.get('mz_legs', {})
+            for l in leg_names:
+                if l in ml:
+                    leg_mz[l].append(ml[l])
+
+        mz_rows = []
+        for l in leg_names:
+            if leg_mz[l]:
+                mz_vals = np.array(leg_mz[l])
+                mz_rows.append([l, f"{np.mean(mz_vals):+.3f}",
+                                f"{np.std(mz_vals):.3f}",
+                                f"{np.max(np.abs(mz_vals)):.3f}"])
+        mz_rows.append(["**Net**",
+                        f"{np.mean([w['mz_net_actual'] for w in ws_ss]):+.3f}",
+                        f"{np.std([w['mz_net_actual'] for w in ws_ss]):.3f}",
+                        f"{np.max(np.abs([w['mz_net_actual'] for w in ws_ss])):.3f}"])
+        _tbl(["Leg", "Avg Mz (Nm)", "Std Mz (Nm)", "Max |Mz| (Nm)"], mz_rows)
+
+        # The 5-layer Mz comparison: PD output -> wrench -> contact -> inertial -> accel
+        lines.append("\n### 5b. Five-Layer Mz Chain\n")
+        mz_raw_pd = np.array([w.get("Mz_raw", 0.0) for w in ws_ss])
+        mz_cmd = np.array([w["Mz_des"] for w in ws_ss])
+        mz_actual = np.array([w["mz_net_actual"] for w in ws_ss])
+        wz_accel = np.gradient([w["wz_world"] for w in ws_ss],
+                               [w["t"] for w in ws_ss])
+        Izz = FULL_SYSTEM_I[2]  # full-system yaw inertia (~0.423, not trunk-only 0.017)
+        mz_inertial = Izz * np.array(wz_accel)
+
+        _tbl(["Layer", "Mean (Nm)", "RMS (Nm)", "Max |.| (Nm)", "Description"],
+             [["Mz_raw_PD", f"{np.mean(mz_raw_pd):.3f}", f"{np.sqrt(np.mean(mz_raw_pd**2)):.3f}",
+               f"{np.max(np.abs(mz_raw_pd)):.3f}", "PD output (rate+angle+integral P/I)"],
+              ["Mz_wrench", f"{np.mean(mz_cmd):.3f}", f"{np.sqrt(np.mean(mz_cmd**2)):.3f}",
+               f"{np.max(np.abs(mz_cmd)):.3f}", "Wrench Mz (0 if direct yaw)"],
+              ["Mz_contact", f"{np.mean(mz_actual):.3f}", f"{np.sqrt(np.mean(mz_actual**2)):.3f}",
+               f"{np.max(np.abs(mz_actual)):.3f}", "Sum rxf per leg at contacts"],
+              ["Mz_inertial", f"{np.mean(mz_inertial):.3f}", f"{np.sqrt(np.mean(mz_inertial**2)):.3f}",
+               f"{np.max(np.abs(mz_inertial)):.3f}", "Izz * alphaz (should approx Mz_contact)"],
+              ["alphaz", f"{np.mean(wz_accel):.3f}", f"{np.sqrt(np.mean(np.array(wz_accel)**2)):.3f}",
+               f"{np.max(np.abs(wz_accel)):.3f}", "Yaw acceleration (rad/s^2)"]])
+
+        # Report whether direct yaw is active
+        if getattr(self, '_use_direct_yaw', False):
+            lines.append("\n**Yaw mode**: DIRECT (Mz_raw -> qfrc_applied on freejoint, Mz_wrench=0)")
+        else:
+            lines.append("\n**Yaw mode**: WRENCH (Mz_raw -> friction distributor -> legs)")
+
+        # Mz gap analysis -- per-layer diagnostic
+        gap_pd_wr = np.mean(np.abs(mz_raw_pd - mz_cmd))
+        gap_wr_ct = np.mean(np.abs(mz_cmd - mz_actual))
+        gap_ct_in = np.mean(np.abs(mz_actual - mz_inertial))
+        lines.append("\n**Mz gaps** (mean abs diff):")
+        pd_wr_tag = "  WARNING: Mz lost to direct bypass" if gap_pd_wr > 1.0 else ""
+        lines.append(f"- PD->Wrench: {gap_pd_wr:.3f} Nm{pd_wr_tag}")
+        wr_ct_tag = "  WARNING: Friction limit active" if gap_wr_ct > 2.0 else ""
+        lines.append(f"- Wrench->Contact: {gap_wr_ct:.3f} Nm{wr_ct_tag}")
+        ct_in_tag = "  CRITICAL: Foot slip or dynamics error" if gap_ct_in > 0.5 else ""
+        lines.append(f"- Contact->Inertial: {gap_ct_in:.3f} Nm{ct_in_tag}")
+        if gap_ct_in > 0.5:
+            lines.append("  -> Check: foot slip (Section 6), Izz correctness, frame consistency")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Section 6: Foot Slip Analysis
+        # ═══════════════════════════════════════════════════════════════════
+        _h("6. Foot Slip Analysis")
+        slip_rows = []
+        for l in leg_names:
+            v = np.array(leg_slip_v[l])
+            slip_rows.append([
+                l, f"{leg_slip_d[l]:.3f}",
+                f"{np.sqrt(np.mean(v**2)):.3f}" if len(v) > 0 else "N/A",
+                f"{np.max(v):.3f}" if len(v) > 0 else "N/A",
+            ])
+        _tbl(["Leg", "Slip Distance (m)", "Slip Vel RMS (m/s)", "Slip Vel Max (m/s)"],
+             slip_rows)
+        max_slip = max(leg_slip_d.values())
+        if max_slip > 0.05:
+            lines.append(f"⚠️ Significant foot slip detected ({max_slip:.3f}m). "
+                         f"Contact forces may not be fully transmitted.")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Section 7: Contact Force Feasibility
+        # ═══════════════════════════════════════════════════════════════════
+        _h("7. Contact Force Feasibility (Friction Cone Margin)")
+        fmargin = {l: [] for l in leg_names}
+        for w in ws_ss:
+            fm = w.get('friction_margin', {})
+            for l in leg_names:
+                if l in fm:
+                    fmargin[l].append(fm[l])
+
+        feas_rows = []
+        for l in leg_names:
+            if fmargin[l]:
+                fv = np.array(fmargin[l])
+                feas_rows.append([l, f"{np.mean(fv):.2f}",
+                                  f"{np.min(fv):.2f}",
+                                  f"{np.sum(fv < -1e-6)}/{len(fv)}"])
+        _tbl(["Leg", "Avg Margin (N)", "Min Margin (N)", "Violations"], feas_rows)
+        lines.append(f"\n**μ_utilized**: mean={np.mean([w['mu_utilized'] for w in ws_ss]):.3f}, "
+                     f"max={np.max([w['mu_utilized'] for w in ws_ss]):.3f}")
+        n_infeas = sum(1 for w in ws_ss if not w.get('feasible', True))
+        lines.append(f"**Infeasible steps**: {n_infeas}/{len(ws_ss)} "
+                     f"({100*n_infeas/len(ws_ss):.1f}%)")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Section 8: Contact Switch Analysis
+        # ═══════════════════════════════════════════════════════════════════
+        _h("8. Contact Switch Analysis")
+
+        # Detect transitions from _debug_steps — group by leg first
+        # (entries are ordered FR,FL,RR,RL per step, so consecutive entries
+        #  have different legs)
+        switch_events = []
+        for leg_name in ALL_LEGS:
+            leg_ds = [d for d in ds if d.get('leg') == leg_name]
+            for i in range(1, len(leg_ds)):
+                prev_s, curr_s = leg_ds[i-1].get('state'), leg_ds[i].get('state')
+                if prev_s != curr_s:
+                    ff_curr = np.sqrt(leg_ds[i].get('ff_fx',0)**2 + leg_ds[i].get('ff_fy',0)**2
+                                      + leg_ds[i].get('ff_fz',0)**2)
+                    ff_prev = np.sqrt(leg_ds[i-1].get('ff_fx',0)**2 + leg_ds[i-1].get('ff_fy',0)**2
+                                      + leg_ds[i-1].get('ff_fz',0)**2)
+                    delta_f = ff_curr - ff_prev
+                    switch_events.append({
+                        't': leg_ds[i]['t'], 'leg': leg_name,
+                        'transition': f"{prev_s}→{curr_s}",
+                        'delta_f_norm': float(delta_f),
+                        'ff_after': float(ff_curr),
+                    })
+
+        if switch_events:
+            # Per-leg touchdown ΔF
+            td_events = [e for e in switch_events if 'swing→stance' in e['transition']]
+            if td_events:
+                lines.append("\n### Touchdown Force Jumps\n")
+                td_rows = []
+                for e in sorted(td_events, key=lambda x: x['t'])[:20]:
+                    td_rows.append([f"{e['t']:.3f}", e['leg'], e['transition'],
+                                    f"{e['delta_f_norm']:.1f}", f"{e['ff_after']:.1f}"])
+                _tbl(["t (s)", "Leg", "Transition", "Δ|F| (N)", "|F| after (N)"], td_rows)
+                max_jump = max(e['delta_f_norm'] for e in td_events)
+                body_wt = TOTAL_WEIGHT
+                lines.append(f"\n**Max TD force jump**: {max_jump:.1f} N "
+                             f"({100*max_jump/body_wt:.1f}% of body weight)")
+                if max_jump > body_wt:
+                    lines.append("⚠️ Touchdown force jump exceeds body weight — "
+                                 "likely causing yaw/pitch spikes.")
+        else:
+            lines.append("\nNo phase transitions detected (insufficient data).")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Section 9: Solver Status
+        # ═══════════════════════════════════════════════════════════════════
+        _h("9. Friction Solver Status")
+        n_feas = sum(1 for w in ws_ss if w.get('feasible', True))
+        n_total_ss = len(ws_ss)
+        alphas = [w.get('nullspace_alpha', 0.0) for w in ws_ss]
+        lines.append(f"**Solver type**: FrictionForceDistributor "
+                     f"(2-leg nullspace, analytic)")
+        lines.append(f"**Feasible**: {n_feas}/{n_total_ss} "
+                     f"({100*n_feas/max(n_total_ss,1):.1f}%)")
+        lines.append(f"**Infeasible**: {n_total_ss - n_feas}/{n_total_ss} "
+                     f"({100*(n_total_ss-n_feas)/max(n_total_ss,1):.1f}%)")
+        if alphas:
+            lines.append(f"**Nullspace α**: mean={np.mean(alphas):.4f}, "
+                         f"std={np.std(alphas):.4f}, max|α|={np.max(np.abs(alphas)):.4f}")
+            lines.append(f"  (α=0 → minimum-norm solution inside friction cone; "
+                         f"α≠0 → nullspace offset needed)")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Section 10: Diagnostic Summary
+        # ═══════════════════════════════════════════════════════════════════
+        _h("10. Diagnostic Summary")
+        issues = []
+        if wz_pct < 20:
+            issues.append("🔴 **CRITICAL**: wz tracking <20% — yaw control is essentially broken.")
+        elif wz_pct < 40:
+            issues.append("🟡 **WARNING**: wz tracking <40% — marginal yaw control.")
+        else:
+            issues.append(f"🟢 wz tracking at {wz_pct:.1f}% — yaw control is functional.")
+        if vx_pct < 50:
+            issues.append("🔴 vx tracking <50% — forward velocity degraded.")
+        # Recompute Mz gaps for diagnostic (from raw arrays in ws_ss)
+        _mz_raw = np.array([w.get('Mz_raw', 0.0) for w in ws_ss])
+        _mz_cmd = np.array([w['Mz_des'] for w in ws_ss])
+        _mz_act = np.array([w['mz_net_actual'] for w in ws_ss])
+        _wz_acc = np.gradient([w['wz_world'] for w in ws_ss],
+                             [w['t'] for w in ws_ss])
+        _mz_inr = FULL_SYSTEM_I[2] * np.array(_wz_acc)
+        _gap_wr_ct = float(np.mean(np.abs(_mz_cmd - _mz_act)))
+        _gap_ct_in = float(np.mean(np.abs(_mz_act - _mz_inr)))
+        if _gap_wr_ct > 2.0:
+            issues.append(f"🔴 Mz wrench→contact gap is {_gap_wr_ct:.2f} Nm — "
+                          "force distribution is losing desired yaw torque.")
+        if _gap_ct_in > 0.5:
+            issues.append(f"🟡 Mz contact→inertial gap is {_gap_ct_in:.2f} Nm — "
+                          "unmodeled forces or dynamics mismatch.")
+        if yaw_drift > 0.05 and abs(self.target_vyaw) < 0.01:
+            issues.append(f"🟡 Yaw drift at {yaw_drift*180/np.pi:.2f} deg/s with zero command.")
+        if max_slip > 0.05:
+            issues.append(f"🔴 Max foot slip {max_slip:.3f}m — significant traction loss.")
+        if n_infeas > 0.05 * n_total_ss:
+            issues.append(f"🔴 {100*n_infeas/n_total_ss:.1f}% steps infeasible — "
+                          "desired wrench exceeds friction limits.")
+        if not issues:
+            issues.append("🟢 No major issues detected.")
+
+        for issue in issues:
+            lines.append(f"- {issue}")
+
+        # Layer diagnosis
+        lines.append("\n### Layer Diagnosis (see Section 5b)\n")
+        # Use Mz_raw (PD output) for Cmd check when direct yaw is active
+        _use_direct = getattr(self, '_use_direct_yaw', False)
+        mz_pd_mean = np.mean(np.abs(_mz_raw))
+        mz_act_mean = np.mean(np.abs(_mz_act))
+        mz_inr_mean = np.mean(np.abs(_mz_inr))
+        if _use_direct:
+            if mz_pd_mean < 0.5:
+                lines.append("- **PD≈0**: Yaw PD is not producing output → check Kp_yaw, yaw_P_eff, error signal")
+            lines.append(f"- **Direct yaw active**: Mz_raw (PD) mean={mz_pd_mean:.2f} Nm, applied to freejoint")
+        else:
+            if mz_pd_mean < 0.5:
+                lines.append("- **Cmd≈0**: Body PD is not commanding yaw torque → check gains (Kp_yaw, yaw_P_eff)")
+        if mz_pd_mean > 1.0 and mz_act_mean < 0.5 * mz_pd_mean:
+            lines.append("- **PD≠Contact**: Achieved Mz much less than commanded → check friction constraints, leg geometry")
+        if mz_act_mean > 0.5 and mz_inr_mean < 0.3 * mz_act_mean:
+            lines.append("- **Contact≠Inertial**: Achieved Mz not producing yaw accel → check foot slip, Izz, frame consistency")
+        if mz_inr_mean > 0.3:
+            wz_actual_mean = np.mean(np.abs([w['wz_world'] for w in ws_ss]))
+            if wz_actual_mean < 0.3 * abs(self.target_vyaw + 0.01):
+                lines.append("- **αz≠wz**: Yaw acceleration exists but yaw rate doesn't accumulate → check integration, state estimation")
+
+        report = "\n".join(lines) + "\n"
+
+        # Write to file if path provided
+        if output_path:
+            _os.makedirs(_os.path.dirname(output_path) or ".", exist_ok=True)
+            with open(output_path, 'w') as f:
+                f.write(report)
+            print(f"\n[Debug] Report written to {output_path}")
+
+        return report
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1227,9 +1935,9 @@ class MomentumController(QuinticFrictionController):
         alphaz = (self._K_m_yaw * (self.target_vyaw - world_wz)
                   + 3.0 * yaw_err_angle + 2.0 * yaw_err_int)
 
-        Mx = TRUNK_I[0] * alphax
-        My = TRUNK_I[1] * alphay
-        Mz = TRUNK_I[2] * alphaz
+        Mx = FULL_SYSTEM_I[0] * alphax
+        My = FULL_SYSTEM_I[1] * alphay
+        Mz = FULL_SYSTEM_I[2] * alphaz
 
         return np.array([Fx, Fy, Fz, Mx, My, Mz])
 

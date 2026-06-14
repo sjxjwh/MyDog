@@ -1018,6 +1018,15 @@ def run_gait_quintic_viewer(model_path: str, gait_type: GaitType,
 
     print("Viewer closed.\n")
 
+    # ── Generate detailed debug report for yaw analysis ──
+    from datetime import datetime as _dt
+    from pathlib import Path as _Path
+    _report_dir2 = _Path(__file__).resolve().parent.parent / "output"
+    _report_dir2.mkdir(parents=True, exist_ok=True)
+    _ts2 = _dt.now().strftime("%Y%m%d_%H%M%S")
+    _report_path2 = _report_dir2 / f"trot_yaw_debug_{_ts2}.md"
+    mc.generate_debug_report(output_path=str(_report_path2))
+
 
 def run_gait_quintic_headless(model_path: str, gait_type: GaitType,
                                params: GaitParams, dt: float = 0.002,
@@ -1109,6 +1118,15 @@ def run_gait_quintic_headless(model_path: str, gait_type: GaitType,
               f"step_length={fstats['step_length']:.3f}m")
     mc._metrics.print_summary()
     print("Simulation complete.\n")
+
+    # ── Generate detailed debug report for yaw analysis ──
+    from datetime import datetime as _dt
+    from pathlib import Path as _Path
+    _report_dir = _Path(__file__).resolve().parent.parent / "output"
+    _report_dir.mkdir(parents=True, exist_ok=True)
+    _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    _report_path = _report_dir / f"trot_yaw_debug_{_ts}.md"
+    mc.generate_debug_report(output_path=str(_report_path))
 
 
 def plot_gait_results(data: dict, gait_type: GaitType, output_dir: Path):
