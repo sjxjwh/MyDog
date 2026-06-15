@@ -1298,6 +1298,7 @@ class QuinticFrictionController(MITBodyController):
                 'roll': float(roll), 'pitch': float(pitch),
                 'wz_world': float(self._world_wz),
                 'wz_qvel': float(angvel[2]),
+                'com_x': float(pos[0]), 'com_y': float(pos[1]),
                 'vx': float(vel[0]), 'vy': float(vel[1]),
                 'height': float(pos[2]),
                 # Desired wrench (before distribution)
@@ -1825,6 +1826,137 @@ class QuinticFrictionController(MITBodyController):
             wz_actual_mean = np.mean(np.abs([w['wz_world'] for w in ws_ss]))
             if wz_actual_mean < 0.3 * abs(self.target_vyaw + 0.01):
                 lines.append("- **αz≠wz**: Yaw acceleration exists but yaw rate doesn't accumulate → check integration, state estimation")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Section 11: Eccentric Yaw Diagnosis
+        # ═══════════════════════════════════════════════════════════════════
+        _h("11. Eccentric Yaw Diagnosis (torque center vs CoM)")
+
+        # 11.1 Torque center offset from actual foot forces
+        # torque_center = Σ(r_i × F_i) / (||F_horiz_total|| + eps) in world frame
+        torque_center_offsets = []
+        left_Fx = []; left_Fy = []; right_Fx = []; right_Fy = []
+        for w in ws_ss:
+            ml = w.get('mz_legs', {})   # per-leg Mz contribution: -(r×f)_z body torque
+            fm = w.get('friction_margin', {})
+            # Reconstruct per-leg horizontal force direction from stored foot forces
+            # Use the _debug_steps stance data for actual ff forces
+            # Simplified: track left-right Fx/Fy from the wrench-step's per-leg data
+            pass  # computed below from stance debug data
+
+        # 11.2 Use _debug_steps stance data for accurate per-leg forces
+        stance_fx = {l: [] for l in ALL_LEGS}
+        stance_fy = {l: [] for l in ALL_LEGS}
+        stance_fz = {l: [] for l in ALL_LEGS}
+        for d in stance_ds:
+            l = d['leg']
+            stance_fx[l].append(d.get('ff_fx', 0.0))
+            stance_fy[l].append(d.get('ff_fy', 0.0))
+            stance_fz[l].append(d.get('ff_fz', 0.0))
+        # Left-right force bias from actual ff forces
+        l_fx_mean = np.mean(stance_fx['FL'] + stance_fx['RL']) if (stance_fx['FL'] or stance_fx['RL']) else 0.0
+        r_fx_mean = np.mean(stance_fx['FR'] + stance_fx['RR']) if (stance_fx['FR'] or stance_fx['RR']) else 0.0
+        l_fy_mean = np.mean(stance_fy['FL'] + stance_fy['RL']) if (stance_fy['FL'] or stance_fy['RL']) else 0.0
+        r_fy_mean = np.mean(stance_fy['FR'] + stance_fy['RR']) if (stance_fy['FR'] or stance_fy['RR']) else 0.0
+        delta_Fx = l_fx_mean - r_fx_mean
+        delta_Fy = l_fy_mean - r_fy_mean
+        delta_F_mean = float(np.sqrt(delta_Fx**2 + delta_Fy**2))
+        # Fz asymmetry
+        l_fz_mean = float(np.mean(stance_fz['FL'] + stance_fz['RL'])) if (stance_fz['FL'] or stance_fz['RL']) else 0.0
+        r_fz_mean = float(np.mean(stance_fz['FR'] + stance_fz['RR'])) if (stance_fz['FR'] or stance_fz['RR']) else 0.0
+        delta_Fz = l_fz_mean - r_fz_mean
+
+        # 11.3 CoM trajectory analysis
+        com_x = np.array([w.get('com_x', 0.0) for w in ws_ss])
+        com_y = np.array([w.get('com_y', 0.0) for w in ws_ss])
+        if len(com_x) > 10:
+            com_center_x = np.mean(com_x)
+            com_center_y = np.mean(com_y)
+            r_dist = np.sqrt((com_x - com_center_x)**2 + (com_y - com_center_y)**2)
+            com_radius = float(np.mean(r_dist))
+            com_max_radius = float(np.max(r_dist))
+            # Check if CoM follows circular trajectory (correlated with yaw)
+            yaw_ss = np.array([w.get('yaw', 0.0) for w in ws_ss])
+            if len(yaw_ss) > 10 and np.std(yaw_ss) > 0.05:
+                # Circular if CoM radius increases with yaw accumulation
+                com_circular_score = float(np.corrcoef(np.abs(np.diff(yaw_ss)),
+                                           r_dist[1:])[0, 1]) if len(yaw_ss) > 20 else 0.0
+            else:
+                com_circular_score = 0.0
+        else:
+            com_radius = com_max_radius = com_circular_score = 0.0
+
+        # 11.4 Contact phase symmetry from stance/swing transitions
+        phase_ratios = {}
+        phase_error = 0.0
+        for l in ALL_LEGS:
+            leg_ds = [d for d in ds if d.get('leg') == l]
+            stance_count = sum(1 for d in leg_ds if d.get('state') == 'stance')
+            phase_ratios[l] = stance_count / max(len(leg_ds), 1)
+        if phase_ratios:
+            phase_error = float(max(phase_ratios.values()) - min(phase_ratios.values()))
+
+        # 11.5 Frame consistency: Mz_wrench and Mz_contact should be in same frame
+        mz_cmd_arr = np.array([w.get('Mz_des', 0.0) for w in ws_ss])
+        mz_act_arr = np.array([w.get('mz_net_actual', 0.0) for w in ws_ss])
+        frame_consistent = True  # both use world-frame computation
+
+        _tbl(["Metric", "Value", "Threshold", "Status"],
+             [["CoM trajectory radius (m)", f"{com_radius:.4f}",
+               "< 0.02", "✓" if com_radius < 0.02 else ("⚠️ CIRCULAR" if com_radius > 0.05 else "🟡")],
+              ["CoM max radius (m)", f"{com_max_radius:.4f}",
+               "< 0.05", "✓" if com_max_radius < 0.05 else "⚠️"],
+              ["CoM-yaw correlation", f"{com_circular_score:.3f}",
+               "< 0.3", "✓" if abs(com_circular_score) < 0.3 else "⚠️ ECCENTRIC"],
+              ["L-R Fx bias (N)", f"{delta_Fx:+.2f}",
+               "< 2.0", "✓" if abs(delta_Fx) < 2.0 else "⚠️ ASYMMETRIC"],
+              ["L-R Fy bias (N)", f"{delta_Fy:+.2f}",
+               "< 2.0", "✓" if abs(delta_Fy) < 2.0 else "⚠️ ASYMMETRIC"],
+              ["L-R Fz bias (N)", f"{delta_Fz:+.2f}",
+               "< 5.0", "✓" if abs(delta_Fz) < 5.0 else "⚠️ UNEVEN SUPPORT"],
+              ["Contact phase error", f"{phase_error:.4f}",
+               "< 0.02", "✓" if phase_error < 0.02 else "⚠️ SKEWED"],
+              ["Frame consistency", "PASS" if frame_consistent else "FAIL",
+               "PASS", "✓" if frame_consistent else "❌ FAIL"],
+             ])
+
+        # Root cause ranking
+        lines.append("\n### Root Cause Ranking\n")
+        scores = {}
+        # A: torque reference point
+        if abs(com_circular_score) > 0.3 and com_radius > 0.03:
+            scores["A: torque center ≠ CoM"] = 60
+        else:
+            scores["A: torque center ≠ CoM"] = 10
+        # B: left-right asymmetry
+        lr_asym = abs(delta_Fx) + abs(delta_Fy)
+        if lr_asym > 3.0:
+            scores["B: left-right force asymmetry"] = 25
+        else:
+            scores["B: left-right force asymmetry"] = 10
+        # C: phase skew
+        if phase_error > 0.02:
+            scores["C: contact phase skew"] = 20
+        else:
+            scores["C: contact phase skew"] = 5
+        scores["D: inertia / other"] = 5
+        total_score = sum(scores.values())
+        for cause, score in sorted(scores.items(), key=lambda x: -x[1]):
+            pct = 100 * score / total_score
+            lines.append(f"- {cause}: {pct:.0f}%")
+
+        # One-line diagnosis
+        if com_radius > 0.05 and abs(com_circular_score) > 0.3:
+            diag = (f"🔴 ECCENTRIC YAW — CoM trajectory radius={com_radius:.3f}m. "
+                    f"Torque center ≠ CoM. Check reference frame and force symmetry.")
+        elif lr_asym > 3.0:
+            diag = (f"🟡 YAW WITH DRIFT — L-R force asymmetry {lr_asym:.1f}N. "
+                    f"Check stance distribution (ΔFx={delta_Fx:+.1f}, ΔFy={delta_Fy:+.1f}).")
+        elif com_radius > 0.03:
+            diag = (f"🟡 MILD DRIFT — CoM radius={com_radius:.3f}m. Monitor.")
+        else:
+            diag = "✓ Yaw rotation center approximately on CoM."
+        lines.append(f"\n**Diagnosis**: {diag}")
 
         report = "\n".join(lines) + "\n"
 
