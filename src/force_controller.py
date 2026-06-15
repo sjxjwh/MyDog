@@ -862,7 +862,11 @@ class QuinticFrictionController(MITBodyController):
         self._yaw_prediction_scale: float = 0.3
         self._force_smoothing_enabled: bool = False
         self._mz_saturated: bool = False
-        self._use_direct_yaw: bool = True  # direct yaw: verified 90% wz
+        # Yaw strategy: kinematics (swing foot placement) PRIMARY +
+        # small direct torque COMPLEMENT (30% of Mz_raw).  Mz=0 in wrench.
+        self._use_direct_yaw: bool = True
+        self._use_kinematic_yaw: bool = True
+        self._direct_yaw_scale: float = 0.3  # fraction of Mz_raw to freejoint
 
         # ── Debug data collection (for yaw analysis reports) ──
         self._debug_enabled: bool = True
@@ -1061,9 +1065,9 @@ class QuinticFrictionController(MITBodyController):
         Mz_raw = (self.Kp_yaw * (self.target_vyaw - angvel[2])
                   + yaw_P_eff * yaw_err_angle
                   + yaw_I_eff * yaw_err_int)
-        # When using direct yaw torque, set Mz=0 in wrench — yaw is handled
-        # via qfrc_applied on the freejoint, bypassing the impedance layer.
-        if getattr(self, '_use_direct_yaw', False):
+        # When yaw is handled by kinematics (foot placement) or direct torque,
+        # set Mz=0 in wrench.  Force control only does Fx/Fy translation.
+        if getattr(self, '_use_direct_yaw', False) or getattr(self, '_use_kinematic_yaw', False):
             Mz = 0.0
         else:
             # Clamp to physically achievable Mz given friction constraints.
@@ -1237,13 +1241,16 @@ class QuinticFrictionController(MITBodyController):
         lat_offset = np.clip(self._planner.K_kin_vy * dvy, -0.05, 0.05)
         # Yaw: rate + angle P + integral (base always active, scaled up for lateral)
         lat_ratio = abs(self.target_vy) / max(abs(self.target_vx) + abs(self.target_vy), 0.01)
-        k_angle = 1.5 + 5.0 * lat_ratio   # 1.5→6.5 rad/rad (3x base)
-        k_int = 3.0 + 6.0 * lat_ratio     # 3.0→9.0 rad/rad·s (3x base)
+        # Kinematic yaw: foot placement is the PRIMARY yaw mechanism.
+        # Gains boosted 2x since Mz=0 in wrench (no force yaw assist).
+        k_angle = 3.0 + 10.0 * lat_ratio  # 3→13 rad/rad
+        k_int = 6.0 + 12.0 * lat_ratio    # 6→18 rad/rad·s
+        self._planner.K_kin_wz = 4.0      # yaw rate look-ahead (was 2.0)
         yaw_offset = np.clip(
             self._planner.K_kin_wz * dwz
             + k_angle * yaw_angle_error
             + k_int * self._yaw_error_integral,
-            -0.8, 0.8)
+            -1.2, 1.2)  # wider range for pure-kinematic yaw
         self._planner.set_kinematic_adjustments(step_delta, lat_offset, yaw_offset)
 
         # Sync kinematic yaw target (disabled, using yaw_offset instead)
@@ -1262,7 +1269,8 @@ class QuinticFrictionController(MITBodyController):
         # layer entirely.  This eliminates the impedance→forward-thrust
         # interference that plagues force-based yaw in trot.
         if getattr(self, '_use_direct_yaw', False) and abs(self.target_vyaw) > 0.001:
-            Mz_direct = getattr(self, '_Mz_raw', 0.0)
+            scale = getattr(self, '_direct_yaw_scale', 1.0)
+            Mz_direct = getattr(self, '_Mz_raw', 0.0) * scale
             # Clamp to safe range (freejoint torque is in Nm)
             Mz_direct = float(np.clip(Mz_direct, -8.0, 8.0))
             trunk_id = self._sim._body_ids.get("trunk")
