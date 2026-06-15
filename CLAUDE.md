@@ -27,7 +27,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - 已完成：浮基动力学仿真（MIT 力控 + 位控 stance 锚定）✅
   - 已完成：SRB 凸 MPC + MIT 阻抗控制 ✅
   - 已完成：三次多项式 + 静摩擦约束力分配（Quintic+Friction 三层架构）✅
+  - 已完成：偏航控制全链路修复 — Izz 矫正 + 混合偏航架构 + 偏心诊断 ✅
   - 进行中：RL 集成 — 让 RL 决策步态类型 + 估计地面 μ_max
+  - 进行中：sim2real 迁移
 - **上层（UniLab）**：用 RL 做智能决策
   - 部署于本地 `/home/scj/UniLab`
   - 输出高层动作：**目标速度、航向角、步态类型、地面摩擦系数 μ_max**
@@ -237,6 +239,19 @@ uv sync --extra motrix
 
 **MJCF 大腿侧向偏移**：hip abduction 关节和 thigh pitch 关节之间有一个 `[0, ±0.08, 0]` 的 body position 偏移（FR/RL 为负，FL/RR 为正）。解析 FK 忽略此偏移，需通过 `_moco_offset` 修正。修正量随 abduction 角度变化（R_abd @ [0, ±0.08, 0]），但正常行走时 abduction ≈ 0，常数修正可接受。
 
+## 偏航控制架构（2026-06-15 更新）
+
+详见 `docs/yaw_control_architecture.md`。关键发现：
+
+- **Izz**: 躯干单独 0.017 → 全系统 M[wz,wz]=0.423（25×），`experiments/golden_izz_test.py` 验证
+- **偏航方案**: 运动学落脚点偏移（物理可实现，73%/vyaw=0.2）+ 直连偏航力矩（仿真辅助，90%）。
+  - 混合模式 `_direct_yaw_scale=0.3`（当前默认）：81% vyaw=0.2, 54% vx
+  - 纯运动学 `_direct_yaw_scale=0.0`：73% vyaw=0.2, 50% vx
+- **drift 分析**: 侧向漂移来自前进力与偏航力在摩擦锥内竞争，非 Trot 几何固有。
+  原地自旋时 drift 从 0.028→0.009 m/s（3× 缩减）。`experiments/trace_mz_sign.py` Mz 符号链追踪。
+- **步态影响**: Walk vyaw=0.2 达 95%，Pace 前进+偏航耦合最优
+- **调试报告**: 仿真后自动生成 11 节诊断（5 层 Mz 链 + 偏心偏航检测），输出到 `output/`
+
 ## 常用命令
 
 所有命令需先 `source venv/bin/activate`。
@@ -330,20 +345,23 @@ Simulation complete.
 - T_cycle 缩短到 0.25s（原 0.5s）是速度提升的关键因素
 - Body PD 在 T=0.25 时不稳定，仅 MPC 可用
 
-### Quintic + 静摩擦约束控制
+### Quintic + 静摩擦约束控制（当前推荐）
 
 ```bash
-# 基本模式（五次多项式摆动 + 摩擦约束力分配）
+# 混合偏航（运动学落脚点 + 30% 直连，vyaw=0.2 达 81%）
 python3 -m src.main --gait --float --force --quintic --viewer --gait-type trot \
-    --gait-T 0.25 --step-length 0.22 --target-vx 0.3
+    --gait-T 0.25 --step-length 0.22 --target-vx 0.3 --target-vyaw 0.2
 
-# 偏航测试（运动学偏航，K_kin_wz=0.20，~50% 跟踪率）
-python3 -m src.main --gait --float --force --quintic --viewer --gait-type trot \
-    --target-vyaw 0.5 --gait-cycles 8
+# 纯运动学偏航（物理可实现基准，vyaw=0.2 达 73%）
+# 设置 _direct_yaw_scale=0.0 后运行同上
 
-# 动量控制偏航
-python3 -m src.main --gait --float --force --quintic --momentum --viewer \
-    --gait-type trot --target-vyaw 0.5 --target-vx 0.3 --gait-cycles 8
+# 原地自旋（drift 诊断）
+python3 -m src.main --gait --float --force --quintic --gait-type trot \
+    --gait-T 0.25 --step-length 0.22 --target-vx 0 --target-vyaw 0.2
+
+# Walk 步态（偏航最强，vyaw=0.2 达 95%）
+python3 -m src.main --gait --float --force --quintic --viewer --gait-type walk \
+    --gait-T 0.25 --step-length 0.22 --target-vx 0.3 --target-vyaw 0.2
 
 # 启用 Tier 1 参数自适应
 python3 -m src.main --gait --float --force --quintic --adapt-params --viewer \
